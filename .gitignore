@@ -1,0 +1,29 @@
+# Cloned reference repos (large, don't commit)
+repos/
+
+# Downloaded IRS PDF forms
+forms/
+
+# Sensitive tax documents
+returns-2023/*.pdf
+returns-2024/*.pdf
+data-2025/
+
+# Generated output
+output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Keep directory structure
+!returns-2023/.gitkeep
+!returns-2024/.gitkeep
+!data-2025/.gitkeep
+!output/.gitkeep
+!scripts/.gitkeep

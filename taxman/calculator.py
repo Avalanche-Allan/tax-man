@@ -1,0 +1,881 @@
+"""Tax calculation engine for 2025 federal return.
+
+Computes all form line items from a TaxpayerProfile.
+Each calculation includes the IRS form/line reference and reasoning.
+"""
+
+from dataclasses import dataclass, field
+from typing import Optional
+
+from taxman.constants import (
+    ADDITIONAL_MEDICARE_RATE,
+    ADDITIONAL_MEDICARE_THRESHOLD_MFS,
+    ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
+    ADDITIONAL_MEDICARE_THRESHOLD_SINGLE,
+    ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS,
+    ESTIMATED_TAX_PRIOR_YEAR_HIGH_INCOME_PCT,
+    ESTIMATED_TAX_PRIOR_YEAR_PCT,
+    ESTIMATED_TAX_SAFE_HARBOR_PCT,
+    FEIE_EXCLUSION_LIMIT,
+    MEALS_DEDUCTION_PCT,
+    MFS_BRACKETS,
+    MFJ_BRACKETS,
+    SINGLE_BRACKETS,
+    NIIT_RATE,
+    NIIT_THRESHOLD_MFS,
+    QBI_DEDUCTION_RATE,
+    QBI_PHASEOUT_MFS,
+    QBI_PHASEOUT_MFJ,
+    QBI_THRESHOLD_MFS,
+    QBI_THRESHOLD_MFJ,
+    QBI_THRESHOLD_SINGLE,
+    SE_DEDUCTIBLE_FRACTION,
+    SE_INCOME_FACTOR,
+    SE_MINIMUM_INCOME,
+    SS_TAX_RATE,
+    SS_WAGE_BASE,
+    MEDICARE_TAX_RATE,
+    STANDARD_DEDUCTION,
+)
+from taxman.models import TaxpayerProfile, ScheduleCData, FilingStatus
+
+
+# =============================================================================
+# Filing status helper lookups
+# =============================================================================
+
+BRACKETS_BY_STATUS = {
+    FilingStatus.SINGLE: SINGLE_BRACKETS,
+    FilingStatus.MFJ: MFJ_BRACKETS,
+    FilingStatus.MFS: MFS_BRACKETS,
+    FilingStatus.HOH: SINGLE_BRACKETS,  # HOH uses own brackets but close to Single
+    FilingStatus.QSS: MFJ_BRACKETS,
+}
+
+QBI_THRESHOLDS = {
+    FilingStatus.SINGLE: (QBI_THRESHOLD_SINGLE, QBI_PHASEOUT_MFS),
+    FilingStatus.MFS: (QBI_THRESHOLD_MFS, QBI_PHASEOUT_MFS),
+    FilingStatus.MFJ: (QBI_THRESHOLD_MFJ, QBI_PHASEOUT_MFJ),
+    FilingStatus.HOH: (QBI_THRESHOLD_SINGLE, QBI_PHASEOUT_MFS),
+    FilingStatus.QSS: (QBI_THRESHOLD_MFJ, QBI_PHASEOUT_MFJ),
+}
+
+ADDITIONAL_MEDICARE_THRESHOLDS = {
+    FilingStatus.SINGLE: ADDITIONAL_MEDICARE_THRESHOLD_SINGLE,
+    FilingStatus.MFS: ADDITIONAL_MEDICARE_THRESHOLD_MFS,
+    FilingStatus.MFJ: ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
+    FilingStatus.HOH: ADDITIONAL_MEDICARE_THRESHOLD_SINGLE,
+    FilingStatus.QSS: ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
+}
+
+
+# =============================================================================
+# Calculation Result Containers
+# =============================================================================
+
+@dataclass
+class LineItem:
+    """A single calculated line on a tax form."""
+    form: str
+    line: str
+    description: str
+    amount: float
+    explanation: str = ""
+    irs_reference: str = ""
+
+
+@dataclass
+class ScheduleCResult:
+    """Calculated Schedule C for one business."""
+    business_name: str
+    gross_receipts: float = 0.0       # Line 1
+    returns_allowances: float = 0.0    # Line 2
+    gross_income: float = 0.0          # Line 7
+    total_expenses: float = 0.0        # Line 28
+    net_profit_loss: float = 0.0       # Line 31
+    lines: list[LineItem] = field(default_factory=list)
+
+
+@dataclass
+class ScheduleSEResult:
+    """Calculated Schedule SE."""
+    net_se_earnings: float = 0.0       # Line 3
+    taxable_se_earnings: float = 0.0   # Line 4 (92.35% of net)
+    se_tax: float = 0.0               # Line 12
+    deductible_se_tax: float = 0.0    # 50% of SE tax
+    lines: list[LineItem] = field(default_factory=list)
+
+
+@dataclass
+class ScheduleEResult:
+    """Calculated Schedule E (rental/K-1 income)."""
+    net_rental_income: float = 0.0      # Box 2 rental income
+    ordinary_business_income: float = 0.0  # Box 1
+    guaranteed_payments: float = 0.0    # Box 4
+    interest_income: float = 0.0        # Box 5
+    capital_gains: float = 0.0          # Box 9a
+    se_earnings_from_k1: float = 0.0    # Box 14 (subject to SE tax)
+    total_schedule_e_income: float = 0.0  # All K-1 income combined
+    lines: list[LineItem] = field(default_factory=list)
+
+
+@dataclass
+class Form8995Result:
+    """Calculated QBI deduction."""
+    total_qbi: float = 0.0
+    qbi_deduction: float = 0.0
+    is_limited: bool = False
+    lines: list[LineItem] = field(default_factory=list)
+
+
+@dataclass
+class Form2555Result:
+    """Calculated FEIE."""
+    foreign_earned_income: float = 0.0
+    exclusion_amount: float = 0.0
+    is_beneficial: bool = False
+    tax_with_feie: float = 0.0
+    tax_without_feie: float = 0.0
+    savings: float = 0.0
+    lines: list[LineItem] = field(default_factory=list)
+
+
+@dataclass
+class Form1040Result:
+    """Complete calculated Form 1040."""
+    # Income
+    total_income: float = 0.0          # Line 9
+    adjustments: float = 0.0           # Line 10
+    agi: float = 0.0                   # Line 11
+    deduction: float = 0.0             # Line 13
+    qbi_deduction: float = 0.0        # Line 13, QBI portion
+    taxable_income: float = 0.0        # Line 15
+    # Tax
+    tax: float = 0.0                   # Line 16
+    se_tax: float = 0.0               # Schedule 2
+    additional_medicare: float = 0.0   # Schedule 2
+    niit: float = 0.0                  # Schedule 2 (Net Investment Income Tax)
+    total_tax: float = 0.0            # Line 24
+    # Payments
+    total_payments: float = 0.0        # Line 33
+    estimated_payments: float = 0.0
+    # Result
+    overpayment: float = 0.0          # Line 34
+    amount_owed: float = 0.0          # Line 37
+    # Components
+    schedule_c_results: list[ScheduleCResult] = field(default_factory=list)
+    schedule_se: Optional[ScheduleSEResult] = None
+    schedule_e: Optional[ScheduleEResult] = None
+    qbi: Optional[Form8995Result] = None
+    feie: Optional[Form2555Result] = None
+    lines: list[LineItem] = field(default_factory=list)
+
+
+# =============================================================================
+# Core Calculation Functions
+# =============================================================================
+
+def calculate_schedule_c(biz: ScheduleCData) -> ScheduleCResult:
+    """Calculate Schedule C (Profit or Loss From Business).
+
+    IRS Instructions: https://www.irs.gov/instructions/i1040sc
+    """
+    result = ScheduleCResult(business_name=biz.business_name)
+    lines = []
+
+    # Part I: Income
+    result.gross_receipts = biz.gross_receipts
+    lines.append(LineItem("Schedule C", "1", "Gross receipts or sales",
+                          biz.gross_receipts))
+
+    result.returns_allowances = biz.returns_and_allowances
+    lines.append(LineItem("Schedule C", "2", "Returns and allowances",
+                          biz.returns_and_allowances))
+
+    gross_income = biz.gross_income
+    result.gross_income = gross_income
+    lines.append(LineItem("Schedule C", "7", "Gross income",
+                          gross_income,
+                          "Line 1 minus Line 2 minus COGS"))
+
+    # Part II: Expenses
+    exp = biz.expenses
+    expense_lines = [
+        ("8", "Advertising", exp.advertising),
+        ("9", "Car and truck expenses", exp.car_and_truck),
+        ("10", "Commissions and fees", exp.commissions_and_fees),
+        ("11", "Contract labor", exp.contract_labor),
+        ("13", "Depreciation", exp.depreciation),
+        ("15", "Insurance (other than health)", exp.insurance),
+        ("16a", "Interest: mortgage", exp.interest_mortgage),
+        ("16b", "Interest: other", exp.interest_other),
+        ("17", "Legal and professional services", exp.legal_and_professional),
+        ("18", "Office expense", exp.office_expense),
+        ("20a", "Rent: vehicles/equipment", exp.rent_vehicles_equipment),
+        ("20b", "Rent: other", exp.rent_other),
+        ("21", "Repairs and maintenance", exp.repairs_maintenance),
+        ("22", "Supplies", exp.supplies),
+        ("23", "Taxes and licenses", exp.taxes_licenses),
+        ("24a", "Travel", exp.travel),
+        ("24b", "Meals (50%)", round(exp.meals * MEALS_DEDUCTION_PCT, 2)),
+        ("25", "Utilities", exp.utilities),
+        ("26", "Wages", exp.wages),
+        ("27a", "Other expenses", exp.other_expenses),
+    ]
+
+    total_expenses = 0.0
+    for line_num, desc, amount in expense_lines:
+        if amount > 0:
+            lines.append(LineItem("Schedule C", line_num, desc, round(amount, 2)))
+            total_expenses += amount
+
+    # Home office deduction
+    home_office_deduction = 0.0
+    if biz.home_office:
+        if biz.home_office.use_simplified_method:
+            home_office_deduction = biz.home_office.simplified_deduction
+            lines.append(LineItem("Schedule C", "30",
+                                  "Business use of home (simplified method)",
+                                  round(home_office_deduction, 2),
+                                  f"{min(biz.home_office.square_footage, 300):.0f} sqft × $5/sqft"))
+        else:
+            home_office_deduction = biz.home_office.regular_deduction
+            lines.append(LineItem("Schedule C", "30",
+                                  "Business use of home (regular method, Form 8829)",
+                                  round(home_office_deduction, 2),
+                                  f"{biz.home_office.business_percentage:.1%} business use"))
+        total_expenses += home_office_deduction
+
+    result.total_expenses = round(total_expenses, 2)
+    lines.append(LineItem("Schedule C", "28", "Total expenses before home office",
+                          round(total_expenses - home_office_deduction, 2)))
+
+    # Net profit or loss
+    net_profit = round(gross_income - total_expenses, 2)
+    result.net_profit_loss = net_profit
+    lines.append(LineItem("Schedule C", "31", "Net profit or (loss)",
+                          net_profit,
+                          "Line 7 minus Line 28 minus Line 30"))
+
+    result.lines = lines
+    return result
+
+
+def calculate_schedule_se(net_se_income: float) -> ScheduleSEResult:
+    """Calculate Schedule SE (Self-Employment Tax).
+
+    IRS Instructions: https://www.irs.gov/instructions/i1040sse
+
+    SE tax applies to net self-employment earnings of $400 or more.
+    Rate is 15.3% (12.4% Social Security + 2.9% Medicare).
+    Social Security portion caps at the wage base ($176,100 for 2025).
+    """
+    result = ScheduleSEResult()
+    lines = []
+
+    result.net_se_earnings = net_se_income
+    lines.append(LineItem("Schedule SE", "3", "Net SE earnings",
+                          round(net_se_income, 2),
+                          "Combined net profit from Schedule C + K-1 SE earnings"))
+
+    if net_se_income < SE_MINIMUM_INCOME:
+        lines.append(LineItem("Schedule SE", "4", "No SE tax required",
+                              0.0, f"Net SE earnings under ${SE_MINIMUM_INCOME}"))
+        result.lines = lines
+        return result
+
+    # Line 4a: 92.35% of net SE earnings
+    taxable_se = round(net_se_income * SE_INCOME_FACTOR, 2)
+    result.taxable_se_earnings = taxable_se
+    lines.append(LineItem("Schedule SE", "4a",
+                          "Multiply Line 3 by 92.35%",
+                          taxable_se,
+                          f"${net_se_income:,.2f} × 0.9235 = ${taxable_se:,.2f}"))
+
+    # Calculate SS and Medicare portions separately
+    ss_earnings = min(taxable_se, SS_WAGE_BASE)
+    ss_tax = round(ss_earnings * SS_TAX_RATE, 2)
+    medicare_tax = round(taxable_se * MEDICARE_TAX_RATE, 2)
+    se_tax = round(ss_tax + medicare_tax, 2)
+
+    lines.append(LineItem("Schedule SE", "10",
+                          "Social Security tax",
+                          ss_tax,
+                          f"min(${taxable_se:,.2f}, ${SS_WAGE_BASE:,}) × {SS_TAX_RATE}"))
+    lines.append(LineItem("Schedule SE", "11",
+                          "Medicare tax",
+                          medicare_tax,
+                          f"${taxable_se:,.2f} × {MEDICARE_TAX_RATE}"))
+
+    result.se_tax = se_tax
+    lines.append(LineItem("Schedule SE", "12",
+                          "Self-employment tax",
+                          se_tax,
+                          f"SS tax ${ss_tax:,.2f} + Medicare ${medicare_tax:,.2f}"))
+
+    # Deductible half
+    result.deductible_se_tax = round(se_tax * SE_DEDUCTIBLE_FRACTION, 2)
+    lines.append(LineItem("Schedule SE", "13",
+                          "Deductible part of SE tax",
+                          result.deductible_se_tax,
+                          f"50% of ${se_tax:,.2f} — this goes to Schedule 1, Line 15"))
+
+    result.lines = lines
+    return result
+
+
+def calculate_schedule_e(profile: TaxpayerProfile) -> ScheduleEResult:
+    """Calculate Schedule E (Supplemental Income and Loss).
+
+    Handles all K-1 income boxes and flows them to the correct places:
+    - Box 1: Ordinary business income → Schedule E Part II
+    - Box 2: Net rental income → Schedule E Part II
+    - Box 4: Guaranteed payments → Schedule E Part II (also subject to SE tax)
+    - Box 5: Interest income → flows to Schedule B / Form 1040
+    - Box 9a: Net LTCG → flows to Schedule D / Form 1040
+    - Box 14: Self-employment earnings → used for Schedule SE
+
+    For MFS filers: passive rental losses cannot offset non-passive income
+    (IRC §469(i)(5)(B) — the $25K special allowance is $0 for MFS).
+    """
+    result = ScheduleEResult()
+    lines = []
+
+    for k1 in profile.schedule_k1s:
+        # Box 2: Net rental income (passive)
+        rental = k1.net_rental_income
+        if rental < 0 and profile.filing_status == FilingStatus.MFS:
+            # MFS: passive rental losses suspended (no $25K allowance)
+            lines.append(LineItem("Schedule E", "Part II",
+                                  f"K-1 rental loss from {k1.partnership_name} (SUSPENDED)",
+                                  0.0,
+                                  f"Actual loss: ${rental:,.2f}. MFS filers get $0 passive "
+                                  f"loss allowance (IRC §469(i)(5)(B)). Loss is suspended "
+                                  f"and carries forward."))
+            # Don't add to income — loss is suspended
+        else:
+            result.net_rental_income += rental
+            lines.append(LineItem("Schedule E", "Part II",
+                                  f"K-1 rental income from {k1.partnership_name}",
+                                  round(rental, 2),
+                                  "Net rental income from partnership K-1, Box 2"))
+
+        # Box 1: Ordinary business income
+        if k1.ordinary_business_income != 0:
+            result.ordinary_business_income += k1.ordinary_business_income
+            lines.append(LineItem("Schedule E", "K-1 Box 1",
+                                  f"Ordinary business income from {k1.partnership_name}",
+                                  round(k1.ordinary_business_income, 2)))
+
+        # Box 4: Guaranteed payments
+        if k1.guaranteed_payments != 0:
+            result.guaranteed_payments += k1.guaranteed_payments
+            lines.append(LineItem("Schedule E", "K-1 Box 4",
+                                  f"Guaranteed payments from {k1.partnership_name}",
+                                  round(k1.guaranteed_payments, 2),
+                                  "Subject to self-employment tax"))
+
+        # Box 5: Interest income (flows to Schedule B / 1040 Line 2b)
+        if k1.interest_income > 0:
+            result.interest_income += k1.interest_income
+            lines.append(LineItem("Schedule E", "K-1 Box 5",
+                                  f"Interest income from {k1.partnership_name}",
+                                  round(k1.interest_income, 2),
+                                  "Flows to Schedule B / Form 1040 Line 2b"))
+
+        # Box 9a: Net long-term capital gain (flows to Schedule D)
+        if k1.net_long_term_capital_gain != 0:
+            result.capital_gains += k1.net_long_term_capital_gain
+            lines.append(LineItem("Schedule E", "K-1 Box 9a",
+                                  f"Net long-term capital gain from {k1.partnership_name}",
+                                  round(k1.net_long_term_capital_gain, 2),
+                                  "Flows to Schedule D"))
+
+        # Box 14: Self-employment earnings
+        if k1.self_employment_earnings != 0:
+            result.se_earnings_from_k1 += k1.self_employment_earnings
+            lines.append(LineItem("Schedule E", "K-1 Box 14",
+                                  f"SE earnings from {k1.partnership_name}",
+                                  round(k1.self_employment_earnings, 2),
+                                  "Added to Schedule SE calculation"))
+
+    # Total all Schedule E income
+    result.total_schedule_e_income = round(
+        result.net_rental_income + result.ordinary_business_income
+        + result.guaranteed_payments + result.interest_income
+        + result.capital_gains, 2
+    )
+    lines.append(LineItem("Schedule E", "26",
+                          "Total Schedule E income",
+                          result.total_schedule_e_income))
+
+    result.lines = lines
+    return result
+
+
+def calculate_qbi_deduction(
+    taxable_income_before_qbi: float,
+    schedule_c_results: list[ScheduleCResult],
+    filing_status: FilingStatus = FilingStatus.MFS,
+) -> Form8995Result:
+    """Calculate QBI deduction (Form 8995/8995-A).
+
+    Section 199A: 20% deduction on qualified business income.
+
+    For MFS, the threshold where limitations begin is $197,300 (2025).
+    Below threshold: simple 20% of QBI (Form 8995).
+    Above threshold: W-2 wage / capital limitations apply (Form 8995-A).
+    """
+    result = Form8995Result()
+    lines = []
+
+    total_qbi = sum(r.net_profit_loss for r in schedule_c_results)
+    result.total_qbi = total_qbi
+    lines.append(LineItem("Form 8995", "1-3",
+                          "Total qualified business income",
+                          round(total_qbi, 2),
+                          "Sum of net profit from all Schedule C businesses"))
+
+    if total_qbi <= 0:
+        lines.append(LineItem("Form 8995", "—",
+                              "No QBI deduction (QBI is zero or negative)",
+                              0.0))
+        result.lines = lines
+        return result
+
+    # Look up thresholds by filing status
+    threshold, phaseout_range = QBI_THRESHOLDS.get(
+        filing_status, (QBI_THRESHOLD_MFS, QBI_PHASEOUT_MFS)
+    )
+
+    if taxable_income_before_qbi <= threshold:
+        # Simple: 20% of QBI, capped at 20% of taxable income
+        qbi_deduction = total_qbi * QBI_DEDUCTION_RATE
+        max_deduction = taxable_income_before_qbi * QBI_DEDUCTION_RATE
+        qbi_deduction = min(qbi_deduction, max_deduction)
+        result.qbi_deduction = round(qbi_deduction, 2)
+        result.is_limited = False
+
+        lines.append(LineItem("Form 8995", "10",
+                              "QBI deduction (20% of QBI)",
+                              result.qbi_deduction,
+                              f"Below {filing_status.value.upper()} threshold of "
+                              f"${threshold:,}. 20% × ${total_qbi:,.2f} = "
+                              f"${total_qbi * QBI_DEDUCTION_RATE:,.2f}"))
+    else:
+        # Above threshold — W-2 wage / UBIA limitations
+        result.is_limited = True
+        excess = taxable_income_before_qbi - threshold
+        phase_out_pct = min(excess / phaseout_range, 1.0)
+
+        # With no W-2 wages and no UBIA, the wage limitation = $0
+        limited_amount = 0.0
+        full_amount = total_qbi * QBI_DEDUCTION_RATE
+        qbi_deduction = full_amount - (full_amount - limited_amount) * phase_out_pct
+
+        result.qbi_deduction = round(max(qbi_deduction, 0.0), 2)
+        lines.append(LineItem("Form 8995-A", "16",
+                              "QBI deduction (limited)",
+                              result.qbi_deduction,
+                              f"Above threshold. Taxable income "
+                              f"${taxable_income_before_qbi:,.2f} exceeds "
+                              f"${threshold:,} by ${excess:,.2f}. "
+                              f"Phase-out: {phase_out_pct:.1%}. "
+                              f"No W-2 wages paid = $0 wage limitation."))
+
+    result.lines = lines
+    return result
+
+
+def calculate_income_tax(taxable_income: float,
+                         brackets: Optional[list[tuple]] = None) -> float:
+    """Calculate federal income tax using progressive brackets."""
+    if brackets is None:
+        brackets = MFS_BRACKETS
+
+    tax = 0.0
+    prev_bound = 0
+
+    for upper_bound, rate in brackets:
+        if taxable_income <= prev_bound:
+            break
+        taxable_in_bracket = min(taxable_income, upper_bound) - prev_bound
+        tax += taxable_in_bracket * rate
+        prev_bound = upper_bound
+
+    return round(tax, 2)
+
+
+def calculate_additional_medicare(
+    se_earnings: float,
+    filing_status: FilingStatus = FilingStatus.MFS,
+) -> float:
+    """Calculate Additional Medicare Tax (0.9%) on SE earnings above threshold.
+
+    Form 8959. Threshold for MFS is $125,000.
+    """
+    threshold = ADDITIONAL_MEDICARE_THRESHOLDS.get(
+        filing_status, ADDITIONAL_MEDICARE_THRESHOLD_MFS
+    )
+    excess = max(se_earnings - threshold, 0)
+    return round(excess * ADDITIONAL_MEDICARE_RATE, 2)
+
+
+def calculate_niit(
+    net_investment_income: float,
+    agi: float,
+    filing_status: FilingStatus = FilingStatus.MFS,
+) -> float:
+    """Calculate Net Investment Income Tax (3.8%).
+
+    IRC §1411. Applies to lesser of net investment income or
+    AGI excess over threshold. Threshold for MFS is $125,000.
+    """
+    threshold = NIIT_THRESHOLD_MFS  # Same as Additional Medicare for MFS
+    agi_excess = max(agi - threshold, 0)
+    taxable_nii = min(net_investment_income, agi_excess)
+    return round(taxable_nii * NIIT_RATE, 2)
+
+
+def evaluate_feie(
+    profile: TaxpayerProfile,
+    taxable_income_no_feie: float,
+    tax_without_feie: float,
+    earned_income: float,
+) -> Form2555Result:
+    """Evaluate whether the Foreign Earned Income Exclusion is beneficial.
+
+    Key: FEIE excludes income from income tax only, NOT from SE tax.
+    Uses the stacking method per Form 2555 instructions:
+    1. Compute tax on full taxable income (as if no exclusion)
+    2. Compute tax on the excluded amount
+    3. Tax with FEIE = (1) minus (2)
+
+    Args:
+        profile: Taxpayer profile
+        taxable_income_no_feie: Actual taxable income without FEIE
+        tax_without_feie: Income tax computed without FEIE
+        earned_income: Total foreign earned income (Schedule C profits)
+    """
+    result = Form2555Result()
+    lines = []
+
+    result.foreign_earned_income = earned_income
+
+    # Physical presence test (330 days in any consecutive 12-month period)
+    days_abroad = profile.days_in_foreign_country_2025
+    qualifies = days_abroad >= 330
+
+    lines.append(LineItem("Form 2555", "Physical Presence",
+                          f"Days in foreign country: {days_abroad}",
+                          float(days_abroad),
+                          f"Need 330 full days in 12-month period. "
+                          f"{'QUALIFIES' if qualifies else 'DOES NOT QUALIFY'}. "
+                          f"Note: test is any 12-month period overlapping the "
+                          f"tax year, not just calendar year."))
+
+    if not qualifies:
+        result.is_beneficial = False
+        result.lines = lines
+        return result
+
+    # Exclusion amount
+    exclusion = min(earned_income, FEIE_EXCLUSION_LIMIT)
+    result.exclusion_amount = exclusion
+    lines.append(LineItem("Form 2555", "42",
+                          "Foreign earned income exclusion",
+                          round(exclusion, 2),
+                          f"Lesser of earned income ${earned_income:,.2f} "
+                          f"or limit ${FEIE_EXCLUSION_LIMIT:,}"))
+
+    # Stacking method: use actual taxable income, not raw earned income
+    # Tax on full taxable income (already computed as tax_without_feie)
+    # Tax on excluded portion (at the bottom of the bracket stack)
+    tax_on_excluded = calculate_income_tax(exclusion)
+    tax_with_feie = max(tax_without_feie - tax_on_excluded, 0)
+
+    result.tax_with_feie = round(tax_with_feie, 2)
+    result.tax_without_feie = round(tax_without_feie, 2)
+    result.savings = round(tax_without_feie - tax_with_feie, 2)
+    result.is_beneficial = result.savings > 0
+
+    lines.append(LineItem("Form 2555", "Analysis",
+                          "Tax comparison",
+                          result.savings,
+                          f"Tax WITHOUT FEIE: ${tax_without_feie:,.2f}\n"
+                          f"Tax WITH FEIE: ${tax_with_feie:,.2f}\n"
+                          f"Income tax savings: ${result.savings:,.2f}\n"
+                          f"Note: SE tax is UNCHANGED by FEIE.\n"
+                          f"{'BENEFICIAL' if result.is_beneficial else 'NOT BENEFICIAL'}"))
+
+    result.lines = lines
+    return result
+
+
+# =============================================================================
+# Master Calculation — Builds the Full Return
+# =============================================================================
+
+def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
+    """Calculate the complete federal tax return.
+
+    This is the main entry point. It computes all forms and schedules
+    and produces a complete Form1040Result with every line item.
+    """
+    result = Form1040Result()
+    lines = []
+    fs = profile.filing_status
+
+    # ─── SCHEDULE C (for each business) ─────────────────────────
+    total_business_income = 0.0
+    for biz in profile.businesses:
+        sc = calculate_schedule_c(biz)
+        result.schedule_c_results.append(sc)
+        total_business_income += sc.net_profit_loss
+        lines.append(LineItem("Schedule 1", "3",
+                              f"Business income: {biz.business_name}",
+                              sc.net_profit_loss,
+                              "From Schedule C, Line 31"))
+
+    # ─── SCHEDULE E (K-1 income) ───────────────────────────────
+    sch_e = None
+    k1_se_income = 0.0
+    k1_other_income = 0.0
+    net_investment_income = 0.0
+
+    if profile.schedule_k1s:
+        sch_e = calculate_schedule_e(profile)
+        result.schedule_e = sch_e
+
+        # K-1 SE earnings (Box 14 / guaranteed payments) feed into SE tax
+        k1_se_income = sch_e.se_earnings_from_k1 + sch_e.guaranteed_payments
+
+        # Rental income is net investment income for NIIT
+        net_investment_income += max(sch_e.net_rental_income, 0)
+        net_investment_income += sch_e.interest_income
+        net_investment_income += max(sch_e.capital_gains, 0)
+
+        # All K-1 income flows to Schedule 1
+        k1_other_income = sch_e.total_schedule_e_income
+
+    # ─── SCHEDULE SE ───────────────────────────────────────────
+    # SE income = Schedule C profits + K-1 SE earnings
+    total_se_income = total_business_income + k1_se_income
+    if total_se_income >= SE_MINIMUM_INCOME:
+        se = calculate_schedule_se(total_se_income)
+        result.schedule_se = se
+        result.se_tax = se.se_tax
+
+    # ─── FORM 1040: INCOME ─────────────────────────────────────
+    wages = 0.0
+
+    # Schedule 1 income: business + K-1
+    schedule_1_income = total_business_income + k1_other_income
+    lines.append(LineItem("Form 1040", "8",
+                          "Other income (Schedule 1)",
+                          round(schedule_1_income, 2)))
+
+    result.total_income = round(wages + schedule_1_income, 2)
+    lines.append(LineItem("Form 1040", "9", "Total income",
+                          result.total_income))
+
+    # ─── ADJUSTMENTS TO INCOME (Schedule 1, Part II) ───────────
+    adjustments = 0.0
+
+    # Deductible half of SE tax
+    if result.schedule_se:
+        adj_se = result.schedule_se.deductible_se_tax
+        adjustments += adj_se
+        lines.append(LineItem("Schedule 1", "15",
+                              "Deductible part of self-employment tax",
+                              adj_se))
+
+    # Self-employed health insurance deduction
+    # Per Form 7206 / Pub 535: limited to net profit from the business
+    # under which the plan is established, minus the deductible SE tax
+    if profile.health_insurance and profile.health_insurance.total_premiums > 0:
+        se_tax_deduction = result.schedule_se.deductible_se_tax if result.schedule_se else 0
+        max_health = max(total_business_income - se_tax_deduction, 0)
+        health_deduction = round(min(
+            profile.health_insurance.total_premiums,
+            max_health,
+        ), 2)
+        adjustments += health_deduction
+        lines.append(LineItem("Schedule 1", "17",
+                              "Self-employed health insurance deduction",
+                              health_deduction,
+                              f"100% of premiums (${profile.health_insurance.total_premiums:,.2f}), "
+                              f"limited to net SE income minus deductible SE tax "
+                              f"(${max_health:,.2f})"))
+
+    result.adjustments = round(adjustments, 2)
+    lines.append(LineItem("Form 1040", "10",
+                          "Adjustments to income",
+                          result.adjustments))
+
+    # ─── AGI ───────────────────────────────────────────────────
+    result.agi = round(result.total_income - result.adjustments, 2)
+    lines.append(LineItem("Form 1040", "11",
+                          "Adjusted Gross Income (AGI)",
+                          result.agi,
+                          "Total income minus adjustments"))
+
+    # ─── DEDUCTIONS ────────────────────────────────────────────
+    result.deduction = STANDARD_DEDUCTION[fs.value]
+    lines.append(LineItem("Form 1040", "13a",
+                          f"Standard deduction ({fs.value.upper()})",
+                          result.deduction))
+
+    # ─── QBI DEDUCTION ─────────────────────────────────────────
+    taxable_before_qbi = max(result.agi - result.deduction, 0)
+    qbi_result = calculate_qbi_deduction(
+        taxable_before_qbi, result.schedule_c_results, fs
+    )
+    result.qbi = qbi_result
+    result.qbi_deduction = qbi_result.qbi_deduction
+    lines.append(LineItem("Form 1040", "13b",
+                          "Qualified business income deduction",
+                          result.qbi_deduction))
+
+    # ─── TAXABLE INCOME ────────────────────────────────────────
+    result.taxable_income = round(max(
+        result.agi - result.deduction - result.qbi_deduction, 0
+    ), 2)
+    lines.append(LineItem("Form 1040", "15", "Taxable income",
+                          result.taxable_income))
+
+    # ─── TAX ───────────────────────────────────────────────────
+    brackets = BRACKETS_BY_STATUS.get(fs, MFS_BRACKETS)
+    result.tax = calculate_income_tax(result.taxable_income, brackets)
+    lines.append(LineItem("Form 1040", "16", "Tax",
+                          result.tax,
+                          f"From {fs.value.upper()} tax brackets"))
+
+    # Additional Medicare Tax (Form 8959)
+    if result.schedule_se:
+        result.additional_medicare = calculate_additional_medicare(
+            result.schedule_se.taxable_se_earnings, fs
+        )
+        if result.additional_medicare > 0:
+            lines.append(LineItem("Schedule 2", "23",
+                                  "Additional Medicare Tax (0.9%)",
+                                  result.additional_medicare,
+                                  f"SE earnings ${result.schedule_se.taxable_se_earnings:,.2f} "
+                                  f"exceeds {fs.value.upper()} threshold"))
+
+    # Net Investment Income Tax (Form 8960)
+    if net_investment_income > 0:
+        result.niit = calculate_niit(net_investment_income, result.agi, fs)
+        if result.niit > 0:
+            lines.append(LineItem("Schedule 2", "18",
+                                  "Net Investment Income Tax (3.8%)",
+                                  result.niit,
+                                  f"On ${net_investment_income:,.2f} net investment income"))
+
+    # ─── TOTAL TAX ─────────────────────────────────────────────
+    result.total_tax = round(
+        result.tax + result.se_tax + result.additional_medicare + result.niit, 2
+    )
+    lines.append(LineItem("Form 1040", "24", "Total tax",
+                          result.total_tax,
+                          f"Income tax ${result.tax:,.2f} + "
+                          f"SE tax ${result.se_tax:,.2f} + "
+                          f"Addl Medicare ${result.additional_medicare:,.2f}"
+                          + (f" + NIIT ${result.niit:,.2f}" if result.niit else "")))
+
+    # ─── PAYMENTS ──────────────────────────────────────────────
+    result.estimated_payments = profile.total_estimated_payments
+    result.total_payments = result.estimated_payments
+    lines.append(LineItem("Form 1040", "26",
+                          "Estimated tax payments",
+                          result.estimated_payments))
+    lines.append(LineItem("Form 1040", "33", "Total payments",
+                          result.total_payments))
+
+    # ─── REFUND OR AMOUNT OWED ─────────────────────────────────
+    if result.total_payments > result.total_tax:
+        result.overpayment = round(result.total_payments - result.total_tax, 2)
+        lines.append(LineItem("Form 1040", "34", "Overpaid",
+                              result.overpayment))
+    else:
+        result.amount_owed = round(result.total_tax - result.total_payments, 2)
+        lines.append(LineItem("Form 1040", "37", "Amount you owe",
+                              result.amount_owed))
+
+    result.lines = lines
+    return result
+
+
+# =============================================================================
+# Optimization Analysis
+# =============================================================================
+
+def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
+    """Compare tax outcomes with and without FEIE."""
+    # Calculate without FEIE
+    result_no_feie = calculate_return(profile)
+
+    # Total earned income from Schedule C businesses
+    earned_income = sum(sc.net_profit_loss for sc in result_no_feie.schedule_c_results)
+
+    # Evaluate FEIE using actual taxable income and computed tax
+    feie_eval = evaluate_feie(
+        profile,
+        taxable_income_no_feie=result_no_feie.taxable_income,
+        tax_without_feie=result_no_feie.tax,
+        earned_income=max(earned_income, 0),
+    )
+
+    return {
+        "without_feie": {
+            "income_tax": result_no_feie.tax,
+            "se_tax": result_no_feie.se_tax,
+            "additional_medicare": result_no_feie.additional_medicare,
+            "niit": result_no_feie.niit,
+            "total_tax": result_no_feie.total_tax,
+        },
+        "feie_evaluation": {
+            "qualifies": feie_eval.exclusion_amount > 0,
+            "exclusion_amount": feie_eval.exclusion_amount,
+            "income_tax_with_feie": feie_eval.tax_with_feie,
+            "income_tax_savings": feie_eval.savings,
+            "se_tax_unchanged": result_no_feie.se_tax,
+            "is_beneficial": feie_eval.is_beneficial,
+        },
+        "recommendation": (
+            f"Take the FEIE — saves ${feie_eval.savings:,.2f} in income tax"
+            if feie_eval.is_beneficial
+            else "Skip the FEIE — not beneficial for your situation"
+        ),
+    }
+
+
+def estimate_quarterly_payments(total_tax: float, prior_year_tax: float,
+                                agi: float) -> dict:
+    """Estimate recommended quarterly payments for next year.
+
+    Safe harbor: pay 100% of prior year tax (110% if AGI > $75K MFS)
+    or 90% of current year tax, whichever is less.
+    """
+    threshold = ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS
+    prior_year_pct = (ESTIMATED_TAX_PRIOR_YEAR_HIGH_INCOME_PCT
+                      if agi > threshold
+                      else ESTIMATED_TAX_PRIOR_YEAR_PCT)
+
+    safe_harbor_prior = round(prior_year_tax * prior_year_pct, 2)
+    safe_harbor_current = round(total_tax * ESTIMATED_TAX_SAFE_HARBOR_PCT, 2)
+
+    recommended_annual = min(safe_harbor_prior, safe_harbor_current)
+    quarterly = round(recommended_annual / 4, 2)
+
+    return {
+        "safe_harbor_prior_year": safe_harbor_prior,
+        "safe_harbor_current_year": safe_harbor_current,
+        "recommended_annual": recommended_annual,
+        "recommended_quarterly": quarterly,
+        "method": (
+            f"{'110' if agi > threshold else '100'}% of prior year tax"
+            if safe_harbor_prior <= safe_harbor_current
+            else "90% of current year tax"
+        ),
+    }
