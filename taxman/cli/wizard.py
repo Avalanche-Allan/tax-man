@@ -43,15 +43,30 @@ from taxman.cli.state import SessionState
 from taxman.models import (
     BusinessExpenses,
     BusinessType,
+    CharityReceipt,
     EstimatedPayment,
     FilingStatus,
+    Form1095A,
+    Form1098,
+    Form1099NEC,
+    FormW2,
     HealthInsurance,
     HomeOffice,
     ScheduleCData,
     ScheduleK1,
     TaxpayerProfile,
 )
-from taxman.parse_documents import scan_documents_folder
+from taxman.parse_documents import (
+    ParseResult,
+    parse_1095_a,
+    parse_1098_mortgage,
+    parse_1099_nec,
+    parse_charity_receipt,
+    parse_k1_1065,
+    parse_prior_return,
+    parse_w2,
+    scan_documents_folder,
+)
 from taxman.reports import (
     generate_filing_checklist,
     generate_quarterly_plan as gen_quarterly_text,
@@ -210,6 +225,16 @@ class TaxWizard:
 
     # ── Step 4: Document Review ──────────────────────────────────────
 
+    # Parser dispatch table
+    PARSERS = {
+        "1099-NEC": parse_1099_nec,
+        "W-2": parse_w2,
+        "K-1": parse_k1_1065,
+        "1098": parse_1098_mortgage,
+        "1095-A": parse_1095_a,
+        "Charity Receipt": parse_charity_receipt,
+    }
+
     def _step_document_review(self):
         console.print("\n[bold]Step 4: Document Review[/bold]")
 
@@ -217,15 +242,131 @@ class TaxWizard:
             console.print("[dim]No documents to review.[/dim]")
             return
 
-        for doc in self.scan_results["documents"]:
-            if doc.get("classification") in ("1099-NEC", "K-1", "W-2"):
-                console.print(f"\n[bold]{doc['name']}[/bold] — {doc['classification']}")
-                if "text_preview" in doc:
-                    console.print(f"[dim]{doc['text_preview'][:200]}...[/dim]")
+        parseable_types = set(self.PARSERS.keys()) | {"Prior Return"}
 
-                confirm = questionary.confirm("Accept this document?", default=True).ask()
-                if confirm is None:
-                    raise KeyboardInterrupt
+        for doc in self.scan_results["documents"]:
+            classification = doc.get("classification", "unknown")
+            if classification not in parseable_types:
+                continue
+
+            console.print(f"\n[bold]{doc['name']}[/bold] — {classification}")
+            if "text_preview" in doc:
+                console.print(f"[dim]{doc['text_preview'][:200]}...[/dim]")
+
+            confirm = questionary.confirm("Accept this document?", default=True).ask()
+            if confirm is None:
+                raise KeyboardInterrupt
+
+            if not confirm:
+                continue
+
+            # Parse the accepted document
+            if classification == "Prior Return":
+                try:
+                    prior_data = parse_prior_return(doc["path"])
+                    prior_tax = prior_data.get("data", {}).get("Form 1040", {}).get("line_24", 0)
+                    if prior_tax:
+                        console.print(f"  [green]Prior year total tax: {format_currency(prior_tax)}[/green]")
+                except Exception as e:
+                    console.print(f"  [yellow]Could not parse prior return: {e}[/yellow]")
+                continue
+
+            parser = self.PARSERS.get(classification)
+            if parser:
+                try:
+                    parse_result = parser(doc["path"])
+                    self.parsed_results.append(parse_result)
+                    self._display_parse_result(parse_result)
+                except Exception as e:
+                    console.print(f"  [yellow]Could not parse {doc['name']}: {e}[/yellow]")
+
+        # Persist parsed documents to session
+        self._save_parsed_documents()
+
+    # ── Parse helpers ────────────────────────────────────────────────
+
+    def _display_parse_result(self, pr: ParseResult):
+        """Display extracted values from a parsed document."""
+        confidence_str = f"{pr.confidence:.0%}"
+        style = "green" if pr.confidence >= 0.7 else "yellow"
+        console.print(f"  [{style}]Parsed ({pr.document_type}, confidence: {confidence_str})[/{style}]")
+
+        data = pr.data
+        if isinstance(data, FormW2):
+            console.print(f"    Employer: {data.employer_name}")
+            console.print(f"    Wages: {format_currency(data.wages)}")
+            console.print(f"    Federal withheld: {format_currency(data.federal_tax_withheld)}")
+        elif isinstance(data, Form1099NEC):
+            console.print(f"    Payer: {data.payer_name}")
+            console.print(f"    Compensation: {format_currency(data.nonemployee_compensation)}")
+        elif isinstance(data, ScheduleK1):
+            console.print(f"    Partnership: {data.partnership_name}")
+            if data.net_rental_income:
+                console.print(f"    Rental income: {format_currency(data.net_rental_income)}")
+            if data.ordinary_business_income:
+                console.print(f"    Ordinary income: {format_currency(data.ordinary_business_income)}")
+        elif isinstance(data, Form1098):
+            console.print(f"    Lender: {data.lender_name}")
+            console.print(f"    Mortgage interest: {format_currency(data.mortgage_interest)}")
+
+        if pr.warnings:
+            for w in pr.warnings:
+                console.print(f"    [yellow]Warning: {w}[/yellow]")
+
+        if pr.confidence < 0.7:
+            console.print(f"    [yellow]Low confidence — please review carefully[/yellow]")
+
+    def _save_parsed_documents(self):
+        """Persist parsed results to session for resume support."""
+        from dataclasses import asdict
+
+        self.session.parsed_documents = []
+        for pr in self.parsed_results:
+            entry = {
+                "type": pr.document_type,
+                "file": pr.source_file,
+                "confidence": pr.confidence,
+                "warnings": pr.warnings,
+                "needs_manual_review": pr.needs_manual_review,
+                "data": asdict(pr.data) if pr.data else None,
+            }
+            self.session.parsed_documents.append(entry)
+        self.session.save()
+
+    def _apply_parsed_results(self):
+        """Populate profile from parsed document results.
+
+        Called at the start of _step_income_review to pre-fill profile
+        from parsed documents. Shows user what was populated.
+        """
+        if not self.parsed_results:
+            return
+
+        counts = {}
+        for pr in self.parsed_results:
+            data = pr.data
+            if isinstance(data, FormW2):
+                self.profile.forms_w2.append(data)
+                counts["W-2"] = counts.get("W-2", 0) + 1
+            elif isinstance(data, Form1099NEC):
+                self.profile.forms_1099_nec.append(data)
+                counts["1099-NEC"] = counts.get("1099-NEC", 0) + 1
+            elif isinstance(data, ScheduleK1):
+                self.profile.schedule_k1s.append(data)
+                counts["K-1"] = counts.get("K-1", 0) + 1
+            elif isinstance(data, Form1098):
+                self.profile.forms_1098.append(data)
+                counts["1098"] = counts.get("1098", 0) + 1
+            elif isinstance(data, Form1095A):
+                # Store for potential PTC calculation
+                counts["1095-A"] = counts.get("1095-A", 0) + 1
+            elif isinstance(data, CharityReceipt):
+                counts["Charity"] = counts.get("Charity", 0) + 1
+
+        if counts:
+            console.print("\n[bold]Pre-populated from documents:[/bold]")
+            for doc_type, count in counts.items():
+                console.print(f"  {count} {doc_type}(s)")
 
     # ── Step 5: Personal Info ────────────────────────────────────────
 
@@ -272,6 +413,9 @@ class TaxWizard:
 
     def _step_income_review(self):
         console.print("\n[bold]Step 6: Income Review[/bold]")
+
+        # Apply any parsed document results to profile
+        self._apply_parsed_results()
 
         # How many businesses?
         num_biz = questionary.text(
