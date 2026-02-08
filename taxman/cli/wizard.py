@@ -33,6 +33,12 @@ from taxman.cli.display import (
     display_welcome,
     format_currency,
 )
+from taxman.cli.serialization import (
+    deserialize_profile,
+    deserialize_result,
+    serialize_profile,
+    serialize_result,
+)
 from taxman.cli.state import SessionState
 from taxman.models import (
     BusinessExpenses,
@@ -77,11 +83,26 @@ class TaxWizard:
                  documents_dir: str = "",
                  config=None):
         self.session = session or SessionState.create()
-        self.documents_dir = documents_dir
+        self.documents_dir = documents_dir or self.session.documents_dir
         self.config = config
-        self.profile = TaxpayerProfile()
-        self.result = None
         self.scan_results = None
+        self.parsed_results = []
+
+        # Rehydrate profile and result from session if resuming
+        if self.session.profile_data:
+            self.profile = deserialize_profile(self.session.profile_data)
+        else:
+            self.profile = TaxpayerProfile()
+
+        if self.session.results:
+            self.result = deserialize_result(self.session.results)
+        else:
+            self.result = None
+
+    def _save_profile(self):
+        """Persist the current profile to the session."""
+        self.session.profile_data = serialize_profile(self.profile)
+        self.session.save()
 
     def run(self):
         """Run the wizard from the current step."""
@@ -161,6 +182,8 @@ class TaxWizard:
                     "Is your spouse a nonresident alien?", default=True
                 ).ask()
                 self.profile.spouse_is_nra = nra
+
+        self._save_profile()
 
     # ── Step 3: Document Scan ────────────────────────────────────────
 
@@ -243,6 +266,7 @@ class TaxWizard:
             "first_name": self.profile.first_name,
             "last_name": self.profile.last_name,
         }
+        self._save_profile()
 
     # ── Step 6: Income Review ────────────────────────────────────────
 
@@ -308,6 +332,8 @@ class TaxWizard:
                     partnership_name=pname,
                     net_rental_income=rental_val,
                 ))
+
+        self._save_profile()
 
     # ── Step 7: Business Expenses ────────────────────────────────────
 
@@ -379,6 +405,8 @@ class TaxWizard:
                         internet_business_pct=float(inet_pct or "50"),
                     )
 
+        self._save_profile()
+
     # ── Step 8: Deductions ───────────────────────────────────────────
 
     def _step_deductions(self):
@@ -419,6 +447,8 @@ class TaxWizard:
                     self.profile.estimated_payments.append(
                         EstimatedPayment(quarter=q, amount=amt_val)
                     )
+
+        self._save_profile()
 
     # ── Step 9: Foreign Income ───────────────────────────────────────
 
@@ -463,6 +493,8 @@ class TaxWizard:
             console.print("[yellow]You may not meet the Physical Presence Test "
                           f"({self.profile.days_in_foreign_country_2025}/330 days).[/yellow]")
 
+        self._save_profile()
+
     # ── Step 10: Calculate ───────────────────────────────────────────
 
     def _step_calculate(self):
@@ -480,6 +512,10 @@ class TaxWizard:
         display_tax_breakdown(self.result)
         console.print()
         display_result_panel(self.result)
+
+        # Persist results for export/review commands
+        self.session.results = serialize_result(self.result)
+        self.session.save()
 
     # ── Step 11: Optimization ────────────────────────────────────────
 
@@ -505,6 +541,10 @@ class TaxWizard:
         console.print("\n[bold]Optimization Recommendations[/bold]")
         recs = generate_optimization_recommendations(self.result, self.profile)
         display_optimization_recommendations(recs)
+
+        # Persist updated result (FEIE may have been added)
+        self.session.results = serialize_result(self.result)
+        self.session.save()
 
     # ── Step 12: Generate Forms ──────────────────────────────────────
 

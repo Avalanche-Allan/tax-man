@@ -17,21 +17,21 @@ from taxman.cli.config import SESSIONS_DIR
 @dataclass
 class SessionState:
     """Tracks wizard progress and collected data."""
+    schema_version: int = 1
     session_id: str = ""
     created_at: str = ""
     updated_at: str = ""
     completed_steps: list[str] = field(default_factory=list)
     current_step: str = ""
 
-    # Collected data (serialized as dicts)
+    # Collected data
     filing_status: str = ""
     personal_info: dict = field(default_factory=dict)
     documents_dir: str = ""
     parsed_documents: list[dict] = field(default_factory=list)
-    income_data: dict = field(default_factory=dict)
-    expense_data: dict = field(default_factory=dict)
-    deduction_choices: dict = field(default_factory=dict)
-    foreign_info: dict = field(default_factory=dict)
+
+    # Full profile (replaces fragmented income_data/expense_data/etc.)
+    profile_data: dict = field(default_factory=dict)
 
     # Results (set after calculation)
     results: dict = field(default_factory=dict)
@@ -50,16 +50,30 @@ class SessionState:
 
     @classmethod
     def load(cls, session_id: str) -> Optional["SessionState"]:
-        """Load a session from disk."""
+        """Load a session from disk.
+
+        Handles schema versioning:
+        - Version 0 (legacy, no schema_version key): loads with empty profile_data.
+        - Version 1+: loads profile_data normally.
+        """
         path = SESSIONS_DIR / f"{session_id}.json"
         if not path.exists():
             return None
         with open(path) as f:
             data = json.load(f)
+
+        version = data.get("schema_version", 0)
+
         state = cls()
         for key, value in data.items():
             if hasattr(state, key):
                 setattr(state, key, value)
+
+        # Migrate legacy sessions (version 0 has no profile_data)
+        if version == 0:
+            state.schema_version = 0
+            state.profile_data = {}
+
         return state
 
     def save(self):
