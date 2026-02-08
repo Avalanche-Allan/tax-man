@@ -30,3 +30,6 @@ taxman = "taxman.cli.app:app"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests that require IRS PDF forms on disk (deselect with '-m \"not slow\"')",
+]

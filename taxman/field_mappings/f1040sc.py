@@ -101,17 +101,16 @@ def build_schedule_c_data(sc_result, biz_data=None, profile=None) -> dict:
 
     # f1_39: Line 27a — Other expenses (from list)
     # f1_40: Line 27b — reserved
-    # f1_41: Line 28 — Total expenses before home office
-    data["f1_41[0]"] = format_currency_for_pdf(sc_result.total_expenses)
-    # f1_42: Line 29 — Tentative profit (line 7 minus line 28)
-    tentative = sc_result.gross_income - sc_result.total_expenses
-    # f1_43: Line 30 — Home office deduction
+    # f1_43: Line 30 — Home office deduction (extract first to compute Line 28)
     home_office = 0.0
     for item in sc_result.lines:
         if item.line == "30":
             home_office = item.amount
             data["f1_43[0]"] = format_currency_for_pdf(item.amount)
             break
+    # f1_41: Line 28 — Total expenses BEFORE home office
+    expenses_before_ho = sc_result.total_expenses - home_office
+    data["f1_41[0]"] = format_currency_for_pdf(expenses_before_ho)
     # f1_44: Line 31 — Net profit or (loss)
     data["f1_44[0]"] = format_currency_for_pdf(sc_result.net_profit_loss)
 
