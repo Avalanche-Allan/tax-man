@@ -70,6 +70,7 @@ def review(
         display_result_panel,
         display_tax_breakdown,
     )
+    from taxman.cli.serialization import deserialize_result
     from taxman.cli.state import SessionState
 
     session = SessionState.load(session_id)
@@ -82,12 +83,21 @@ def review(
     console.print(f"Steps completed: {len(session.completed_steps)}")
     console.print(f"Last updated: {session.updated_at}")
 
-    if session.results:
-        console.print("\n[bold]Results on file:[/bold]")
-        for key, val in session.results.items():
-            console.print(f"  {key}: {val}")
-    else:
-        console.print("[dim]No calculated results in this session.[/dim]")
+    if not session.results:
+        console.print(
+            "[red]Error: Session has no calculated results. "
+            "Run 'taxman prepare' first to complete the wizard.[/red]"
+        )
+        raise typer.Exit(1)
+
+    result = deserialize_result(session.results)
+
+    console.print()
+    display_income_table(result.schedule_c_results, result.schedule_e)
+    console.print()
+    display_tax_breakdown(result)
+    console.print()
+    display_result_panel(result)
 
 
 @app.command()
@@ -96,23 +106,83 @@ def export(
     output_dir: str = typer.Option("output", "--output-dir", "-o"),
 ):
     """Generate PDFs and reports from a saved session."""
+    from taxman.cli.serialization import deserialize_profile, deserialize_result
     from taxman.cli.state import SessionState
+    from taxman.reports import (
+        generate_filing_checklist,
+        generate_quarterly_plan,
+        generate_tax_summary,
+        generate_line_detail,
+    )
 
     session = SessionState.load(session_id)
     if not session:
         console.print(f"[red]Session {session_id} not found.[/red]")
         raise typer.Exit(1)
 
+    if not session.profile_data:
+        console.print(
+            "[red]Error: Session has no profile data. "
+            "Run 'taxman prepare' first to complete the wizard.[/red]"
+        )
+        raise typer.Exit(1)
+
+    if not session.results:
+        console.print(
+            "[red]Error: Session has no calculated results. "
+            "Run 'taxman prepare' first to complete the wizard.[/red]"
+        )
+        raise typer.Exit(1)
+
+    profile = deserialize_profile(session.profile_data)
+    result = deserialize_result(session.results)
+
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     console.print(f"[bold]Exporting session {session_id} to {output_dir}[/bold]")
+    generated_files = []
 
-    if not session.results:
-        console.print("[yellow]No results to export. Run 'taxman prepare' first.[/yellow]")
-        raise typer.Exit(1)
+    # Text reports
+    summary = generate_tax_summary(result, profile)
+    summary_path = out / "tax_summary.txt"
+    summary_path.write_text(summary)
+    generated_files.append(summary_path)
 
-    console.print(f"[green]Export complete: {output_dir}[/green]")
+    detail = generate_line_detail(result)
+    detail_path = out / "line_detail.txt"
+    detail_path.write_text(detail)
+    generated_files.append(detail_path)
+
+    checklist = generate_filing_checklist(result, profile)
+    checklist_path = out / "filing_checklist.txt"
+    checklist_path.write_text(checklist)
+    generated_files.append(checklist_path)
+
+    quarterly = generate_quarterly_plan(
+        result.total_tax, 0.0, result.agi,
+        filing_status=profile.filing_status,
+    )
+    quarterly_path = out / "quarterly_plan.txt"
+    quarterly_path.write_text(quarterly)
+    generated_files.append(quarterly_path)
+
+    # PDF generation (may fail if IRS PDFs can't be downloaded)
+    try:
+        from taxman.fill_forms import generate_all_forms
+        pdf_files = generate_all_forms(result, profile, output_dir)
+        for pf in pdf_files:
+            generated_files.append(Path(pf))
+    except Exception as e:
+        console.print(f"[yellow]PDF generation: {e}[/yellow]")
+        console.print("[dim]Text reports were generated successfully.[/dim]")
+
+    console.print()
+    for f in generated_files:
+        size_kb = f.stat().st_size / 1024 if f.exists() else 0
+        console.print(f"  [green]{f.name}[/green] ({size_kb:.1f} KB)")
+
+    console.print(f"\n[green]Export complete: {output_dir} ({len(generated_files)} files)[/green]")
 
 
 @app.command()
@@ -120,8 +190,41 @@ def compare(
     session_id: Optional[str] = typer.Argument(None, help="Session ID"),
 ):
     """Compare tax scenarios (FEIE with/without)."""
+    from taxman.calculator import compare_feie_scenarios
+    from taxman.cli.serialization import deserialize_profile
+    from taxman.cli.state import SessionState
+    from taxman.reports import generate_feie_comparison_report
+
+    if not session_id:
+        console.print(
+            "[red]Error: Session ID required. Usage: taxman compare <session-id>[/red]"
+        )
+        raise typer.Exit(1)
+
+    session = SessionState.load(session_id)
+    if not session:
+        console.print(f"[red]Session {session_id} not found.[/red]")
+        raise typer.Exit(1)
+
+    if not session.profile_data:
+        console.print(
+            "[red]Error: Session has no profile data. "
+            "Run 'taxman prepare' first to complete the wizard.[/red]"
+        )
+        raise typer.Exit(1)
+
+    profile = deserialize_profile(session.profile_data)
+
+    if profile.days_in_foreign_country_2025 < 330:
+        console.print(
+            "[yellow]FEIE requires 330+ days in a foreign country. "
+            f"Profile shows {profile.days_in_foreign_country_2025} days.[/yellow]"
+        )
+
     console.print("[bold]FEIE Comparison[/bold]")
-    console.print("[dim]Run 'taxman prepare' for interactive comparison.[/dim]")
+    scenarios = compare_feie_scenarios(profile)
+    report = generate_feie_comparison_report(scenarios)
+    console.print(report)
 
 
 @app.command()
