@@ -183,11 +183,26 @@ NIIT_THRESHOLD_MFJ = 250_000
 NIIT_RATE = 0.038  # 3.8%
 
 # AMT exemption (IRC §55, Form 6251)
+AMT_EXEMPTION_SINGLE = 88_100
+AMT_EXEMPTION_HOH = 88_100
+AMT_EXEMPTION_MFJ = 137_000
 AMT_EXEMPTION_MFS = 68_500  # Half of MFJ $137,000
+AMT_PHASEOUT_SINGLE = 626_350
+AMT_PHASEOUT_HOH = 626_350
+AMT_PHASEOUT_MFJ = 1_252_700
 AMT_PHASEOUT_MFS = 626_350
+AMT_PHASEOUT_RATE = 0.25  # Exemption reduces by 25 cents per dollar
+AMT_RATE_LOW = 0.26
+AMT_RATE_HIGH = 0.28
+AMT_BREAKPOINT_MFS = 119_550
+AMT_BREAKPOINT_OTHER = 239_100
 
 # Capital loss deduction limit
 CAPITAL_LOSS_LIMIT_MFS = 1_500  # Half of normal $3,000
+CAPITAL_LOSS_LIMIT_OTHER = 3_000  # Single, MFJ, HOH, QSS
+
+# Schedule B threshold (need B if interest or dividends exceed this)
+SCHEDULE_B_THRESHOLD = 1_500
 
 # Self-employed health insurance: 100% deductible as adjustment to income
 # (Schedule 1, Line 17 — NOT a business expense on Schedule C)
@@ -204,6 +219,21 @@ HOME_OFFICE_SIMPLIFIED_MAX_SQFT = 300
 # Section 179 (OBBBA increased)
 SECTION_179_LIMIT = 2_500_000  # Up from $1,220,000
 SECTION_179_PHASEOUT_START = 4_000_000
+
+# =============================================================================
+# CHILD TAX CREDIT — IRC §24, OBBBA 2025
+# Source: OBBBA §201 increased CTC to $2,500 per qualifying child
+# =============================================================================
+
+CTC_AMOUNT_PER_CHILD = 2_500       # OBBBA 2025 (up from $2,000)
+CTC_PHASEOUT_MFJ = 400_000
+CTC_PHASEOUT_OTHER = 200_000
+CTC_PHASEOUT_RATE = 50             # $50 per $1,000 excess MAGI
+ACTC_REFUNDABLE_PER_CHILD = 1_700  # Max refundable portion per child
+ACTC_EARNED_INCOME_THRESHOLD = 2_500
+ACTC_EARNED_INCOME_RATE = 0.15
+ODC_AMOUNT = 500                   # Other dependent credit (non-CTC qualifying)
+
 
 # 100% bonus depreciation restored by OBBBA for property after Jan 20, 2025
 
@@ -228,6 +258,8 @@ Q4_ESTIMATED_DUE = "January 15, 2026"
 # =============================================================================
 
 CO_TAX_RATE = 0.044  # 4.4% flat rate for 2025
+CO_PENSION_SUBTRACTION_55_64 = 20_000  # Age 55-64 pension/annuity subtraction
+CO_PENSION_SUBTRACTION_65_PLUS = 24_000  # Age 65+ pension/annuity subtraction
 CO_STANDARD_DEDUCTION = {
     "single": 15_750,
     "mfj": 31_500,

@@ -85,23 +85,28 @@ Sessions are stored in `~/.taxman/sessions/`.
 
 ### Federal
 
-- **Form 1040** — AGI, taxable income, total tax, refund/owed
-- **Schedule C** (multiple businesses) — gross income, categorized expenses, net profit/loss, home office, COGS
-- **Schedule SE** — self-employment tax (SS + Medicare split), deductible half
-- **Schedule E** — K-1 rental income, partnership income, guaranteed payments, capital gains
-- **Form 8995** — QBI deduction with W-2/UBIA wage limitation and phase-out
+- **Form 1040** — AGI, taxable income, total tax, refund/owed, Lines 1-9 (wages, interest, dividends, capital gains)
+- **Schedule C** (multiple businesses) — gross income, categorized expenses, net profit/loss, home office (simplified + regular with mortgage/RE taxes), COGS
+- **Schedule D** — capital gains/losses from 1099-B, K-1 Boxes 8/9a/10, 1099-DIV Box 2a; loss limitation ($3,000 / $1,500 MFS)
+- **Schedule SE** — self-employment tax (SS + Medicare split), deductible half, W-2 SS wage base coordination
+- **Schedule E** — all K-1 boxes (1-14): rental income, ordinary business income, guaranteed payments, interest, dividends, royalties, capital gains, §1231 gains, other income, §179/other deductions
+- **Form 8995** — QBI deduction with W-2/UBIA wage limitation, phase-out, and §199A(a) cap reduced by net capital gain
 - **Form 2555** — FEIE evaluation with physical presence test and stacking method comparison
+- **Form 6251** — Alternative Minimum Tax with exemption, phaseout (25%/dollar), 26%/28% rates
 - **Form 8959** — Additional Medicare Tax (0.9% above filing-status threshold)
-- **NIIT** — Net Investment Income Tax (3.8% above filing-status threshold)
+- **NIIT** — Net Investment Income Tax (3.8%) on interest, dividends, capital gains, rental income, royalties
+- **Schedule 8812** — Child Tax Credit ($2,500/child OBBBA), Other Dependent Credit ($500), ACTC refundable
 - **Quarterly estimates** — 2026 safe harbor calculations (100%/110% of prior year)
 
-All calculations respect filing status (Single, MFJ, MFS, HOH, QSS). MFS-specific rules are fully implemented: passive rental loss suspension (IRC 469), NIIT/Medicare thresholds, QBI phase-out, FEIE stacking brackets.
+All calculations respect filing status (Single, MFJ, MFS, HOH, QSS). MFS-specific rules are fully implemented: passive rental loss suspension (IRC 469), NIIT/Medicare thresholds, QBI phase-out, FEIE stacking brackets, $1,500 capital loss limit.
 
 ### Colorado
 
 - **Form 104** — flat 4.4% rate on federal taxable income
 - Nonresident apportionment for CO-source income (e.g., Denver rental property)
-- Standard deduction adjustments
+- SALT deduction addback for itemizers
+- TABOR refund subtraction
+- Pension/annuity subtraction (age-based: $20K for 55-64, $24K for 65+)
 
 ## Document Parsing
 
@@ -110,7 +115,7 @@ Parses these document types from PDF:
 | Document | What's Extracted |
 |----------|-----------------|
 | 1099-NEC | Payer/recipient TINs, nonemployee compensation |
-| Schedule K-1 (1065) | Boxes 1-5, 9a, 11, 13, 14 (SE earnings) |
+| Schedule K-1 (1065) | Boxes 1-14 (income, dividends, royalties, capital gains, §1231, §179, SE earnings) |
 | W-2 | Boxes 1-6, 16-17 |
 | 1098 (Mortgage) | Box 1 (interest), Box 6 (points) |
 | 1095-A | Monthly premiums, SLCSP, APTC |
@@ -121,7 +126,7 @@ Each parse returns a `ParseResult` with confidence score, warnings, and a flag f
 
 ## PDF Form Generation
 
-Generates filled IRS PDFs for: 1040, Schedule C, Schedule SE, Schedule E, Form 8995, Form 2555.
+Generates filled IRS PDFs for: 1040, Schedule C, Schedule D, Schedule SE, Schedule E, Form 6251, Form 8995, Form 2555, Schedule 8812.
 
 ```python
 from taxman.fill_forms import generate_all_forms
@@ -197,7 +202,7 @@ print(f"CO tax: ${co_result.co_tax_after_apportion:,.2f}")
 ## Testing
 
 ```bash
-# Run all 218 tests
+# Run all 287 tests
 pytest
 
 # With coverage
@@ -211,13 +216,10 @@ Test files:
 
 | File | Tests | Covers |
 |------|-------|--------|
-| `test_calculator.py` | ~60 | All tax calculations, brackets, SE, QBI, FEIE, NIIT, quarterly |
-| `test_models.py` | ~40 | Dataclass validation, properties, edge cases |
-| `test_validation.py` | ~30 | TIN/EIN format, ranges, percentages |
-| `test_parse_documents.py` | ~25 | PDF parsing, document classification, amount extraction |
-| `test_fill_forms.py` | ~5 | Form paths, IRS URLs |
-| `test_integration.py` | ~20 | Full return scenarios (MFS expat, freelancer, MFJ), consistency |
-| `test_colorado.py` | ~13 | CO source income, Form 104, apportionment |
+| `test_calculator.py` | 122 | All tax calculations, brackets, SE, QBI, FEIE, NIIT, AMT, credits, investment income, Schedule D, K-1 boxes |
+| `test_models.py` | 84 | Dataclass validation, properties, edge cases, parsing, form filling |
+| `test_integration.py` | 61 | Full return scenarios (MFS expat, freelancer, MFJ), consistency |
+| `test_colorado.py` | 20 | CO source income, Form 104, apportionment, SALT addback, pension subtraction |
 
 ## Project Structure
 
@@ -254,7 +256,7 @@ tax-man/
       f8995.py                    # Form 8995 (QBI) field mapping
       f2555.py                    # Form 2555 (FEIE) field mapping
 
-  tests/                          # pytest suite (218 tests)
+  tests/                          # pytest suite (287 tests)
     conftest.py                   # Shared fixtures
     fixtures/profiles.py          # Factory functions for test profiles
     test_calculator.py
@@ -283,6 +285,12 @@ tax-man/
 5. **Taxpayers abroad** get an automatic 2-month extension to June 15, 2026. Interest still accrues from April 15 on any balance owed.
 
 6. **Colorado nonresidents** owe CO tax only on CO-source income. K-1 rental income from Denver property is CO-source.
+
+7. **QBI deduction cap** per IRC §199A(a): 20% of (taxable income minus net capital gain). Net capital gain includes qualified dividends.
+
+8. **AMT** primarily affects itemizers who deduct significant SALT. Standard deduction filers rarely trigger AMT.
+
+9. **Child Tax Credit (OBBBA 2025)** is $2,500 per qualifying child. Phases out at $50 per $1,000 of AGI above $400K (MFJ) or $200K (other). Unused CTC becomes refundable ACTC up to $1,700/child.
 
 ## Dependencies
 

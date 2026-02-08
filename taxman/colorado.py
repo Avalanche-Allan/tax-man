@@ -12,6 +12,8 @@ from typing import Optional
 
 from taxman.calculator import Form1040Result, LineItem
 from taxman.constants import (
+    CO_PENSION_SUBTRACTION_55_64,
+    CO_PENSION_SUBTRACTION_65_PLUS,
     CO_STANDARD_DEDUCTION,
     CO_TAX_RATE,
 )
@@ -84,9 +86,37 @@ def calculate_colorado_104(
                           federal_result.taxable_income,
                           "From federal Form 1040, Line 15"))
 
-    # Additions and subtractions (minimal for this profile)
-    result.co_additions = 0.0
-    result.co_subtractions = 0.0
+    # Additions: state/local tax deduction addback (itemizers only)
+    co_additions = 0.0
+    if profile.uses_itemized_deductions and profile.state_local_tax_deduction > 0:
+        co_additions += profile.state_local_tax_deduction
+        lines.append(LineItem("CO Form 104", "Add",
+                              "State/local tax deduction addback",
+                              profile.state_local_tax_deduction,
+                              "SALT deducted on federal Schedule A added back for CO"))
+    result.co_additions = co_additions
+
+    # Subtractions
+    co_subtractions = 0.0
+    # TABOR refund
+    if profile.co_tabor_refund > 0:
+        co_subtractions += profile.co_tabor_refund
+        lines.append(LineItem("CO Form 104", "Sub",
+                              "TABOR refund subtraction",
+                              profile.co_tabor_refund))
+    # Pension/annuity subtraction (age-based)
+    if profile.co_pension_income > 0 and profile.taxpayer_age >= 55:
+        if profile.taxpayer_age >= 65:
+            pension_limit = CO_PENSION_SUBTRACTION_65_PLUS
+        else:
+            pension_limit = CO_PENSION_SUBTRACTION_55_64
+        pension_sub = min(profile.co_pension_income, pension_limit)
+        co_subtractions += pension_sub
+        lines.append(LineItem("CO Form 104", "Sub",
+                              "Pension/annuity subtraction",
+                              pension_sub,
+                              f"Age {profile.taxpayer_age}: up to ${pension_limit:,}"))
+    result.co_subtractions = co_subtractions
 
     # Colorado taxable income = federal taxable + additions - subtractions
     result.co_taxable_income = max(

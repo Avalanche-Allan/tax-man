@@ -4,9 +4,14 @@ from taxman.models import (
     AccountingMethod,
     BusinessExpenses,
     BusinessType,
+    Dependent,
     EstimatedPayment,
     FilingStatus,
+    Form1099B,
+    Form1099DIV,
+    Form1099INT,
     Form1099NEC,
+    FormW2,
     HealthInsurance,
     HomeOffice,
     ScheduleCData,
@@ -190,4 +195,59 @@ def make_zero_income_profile() -> TaxpayerProfile:
         first_name="Zero",
         last_name="Income",
         filing_status=FilingStatus.SINGLE,
+    )
+
+
+def make_investor_profile() -> TaxpayerProfile:
+    """Single investor with 1099-INT, 1099-DIV, 1099-B — no business."""
+    return TaxpayerProfile(
+        first_name="Invest",
+        last_name="Ment",
+        filing_status=FilingStatus.SINGLE,
+        forms_1099_int=[
+            Form1099INT(
+                payer_name="Savings Bank",
+                interest_income=5_000,
+                tax_exempt_interest=1_000,
+                federal_tax_withheld=500,
+            ),
+        ],
+        forms_1099_div=[
+            Form1099DIV(
+                payer_name="Vanguard",
+                ordinary_dividends=8_000,
+                qualified_dividends=6_000,
+                capital_gain_distributions=3_000,
+                federal_tax_withheld=400,
+            ),
+        ],
+        forms_1099_b=[
+            Form1099B(
+                broker_name="Fidelity",
+                st_proceeds=20_000,
+                st_cost_basis=18_000,
+                lt_proceeds=50_000,
+                lt_cost_basis=35_000,
+                federal_tax_withheld=200,
+            ),
+        ],
+    )
+
+
+def make_family_profile() -> TaxpayerProfile:
+    """MFJ with 2 qualifying children, W-2 income."""
+    return TaxpayerProfile(
+        first_name="Parent",
+        last_name="Family",
+        filing_status=FilingStatus.MFJ,
+        dependents=[
+            Dependent(first_name="Kid1", last_name="Family",
+                      relationship="child", is_qualifying_child_ctc=True),
+            Dependent(first_name="Kid2", last_name="Family",
+                      relationship="child", is_qualifying_child_ctc=True),
+        ],
+        forms_w2=[
+            FormW2(wages=80_000, federal_tax_withheld=12_000,
+                   ss_wages=80_000, medicare_wages=80_000),
+        ],
     )

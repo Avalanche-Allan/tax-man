@@ -77,6 +77,7 @@ class ScheduleK1:
     guaranteed_payments: float = 0.0  # Box 4
     interest_income: float = 0.0  # Box 5
     dividends: float = 0.0  # Box 6a
+    qualified_dividends: float = 0.0  # Box 6b
     royalties: float = 0.0  # Box 7
     net_short_term_capital_gain: float = 0.0  # Box 8
     net_long_term_capital_gain: float = 0.0  # Box 9a
@@ -196,6 +197,86 @@ class Form1095A:
 
 
 @dataclass
+class Form1099INT:
+    """1099-INT: Interest Income"""
+    payer_name: str = ""
+    payer_tin: str = ""
+    interest_income: float = 0.0           # Box 1 (taxable interest)
+    early_withdrawal_penalty: float = 0.0  # Box 2
+    tax_exempt_interest: float = 0.0       # Box 8
+    federal_tax_withheld: float = 0.0      # Box 4
+    tax_year: int = 2025
+
+    def __post_init__(self):
+        if self.payer_tin:
+            self.payer_tin = validate_ein(self.payer_tin, "payer_tin")
+        validate_non_negative(self.interest_income, "interest_income")
+        validate_non_negative(self.tax_exempt_interest, "tax_exempt_interest")
+        validate_non_negative(self.federal_tax_withheld, "federal_tax_withheld")
+
+
+@dataclass
+class Form1099DIV:
+    """1099-DIV: Dividends and Distributions"""
+    payer_name: str = ""
+    payer_tin: str = ""
+    ordinary_dividends: float = 0.0        # Box 1a
+    qualified_dividends: float = 0.0       # Box 1b
+    capital_gain_distributions: float = 0.0  # Box 2a
+    federal_tax_withheld: float = 0.0      # Box 4
+    section_199a_dividends: float = 0.0    # Box 5
+    tax_year: int = 2025
+
+    def __post_init__(self):
+        if self.payer_tin:
+            self.payer_tin = validate_ein(self.payer_tin, "payer_tin")
+        validate_non_negative(self.ordinary_dividends, "ordinary_dividends")
+        validate_non_negative(self.qualified_dividends, "qualified_dividends")
+        validate_non_negative(self.capital_gain_distributions, "capital_gain_distributions")
+        validate_non_negative(self.federal_tax_withheld, "federal_tax_withheld")
+
+
+@dataclass
+class Form1099B:
+    """1099-B: Proceeds From Broker and Barter Exchange Transactions (aggregated)"""
+    broker_name: str = ""
+    broker_tin: str = ""
+    st_proceeds: float = 0.0      # Short-term total proceeds
+    st_cost_basis: float = 0.0    # Short-term total cost basis
+    lt_proceeds: float = 0.0      # Long-term total proceeds
+    lt_cost_basis: float = 0.0    # Long-term total cost basis
+    federal_tax_withheld: float = 0.0
+    tax_year: int = 2025
+
+    def __post_init__(self):
+        if self.broker_tin:
+            self.broker_tin = validate_ein(self.broker_tin, "broker_tin")
+        validate_non_negative(self.federal_tax_withheld, "federal_tax_withheld")
+
+    @property
+    def net_st_gain_loss(self) -> float:
+        return self.st_proceeds - self.st_cost_basis
+
+    @property
+    def net_lt_gain_loss(self) -> float:
+        return self.lt_proceeds - self.lt_cost_basis
+
+
+@dataclass
+class Dependent:
+    """A dependent claimed on the return."""
+    first_name: str = ""
+    last_name: str = ""
+    ssn: str = ""
+    relationship: str = ""
+    is_qualifying_child_ctc: bool = False  # Qualifies for Child Tax Credit
+
+    def __post_init__(self):
+        if self.ssn:
+            self.ssn = validate_tin(self.ssn, "ssn")
+
+
+@dataclass
 class CharityReceipt:
     """Charitable contribution receipt"""
     organization_name: str = ""
@@ -272,6 +353,8 @@ class HomeOffice:
     repairs: float = 0.0
     internet: float = 0.0
     internet_business_pct: float = 0.0  # Stored as decimal (0.0 to 1.0)
+    mortgage_interest: float = 0.0    # From Form 1098 or direct entry
+    real_estate_taxes: float = 0.0    # Annual property taxes
 
     def __post_init__(self):
         # Bug 9 fix: normalize >1 values to decimal
@@ -300,6 +383,8 @@ class HomeOffice:
             + self.utilities * pct
             + self.insurance * pct
             + self.repairs * pct
+            + self.mortgage_interest * pct
+            + self.real_estate_taxes * pct
         )
         # Bug 9 fix: internet_business_pct is always decimal after __post_init__
         internet_deduction = self.internet * self.internet_business_pct
@@ -394,8 +479,15 @@ class TaxpayerProfile:
 
     # Income documents
     forms_w2: list[FormW2] = field(default_factory=list)
+    forms_1098: list[Form1098] = field(default_factory=list)
     forms_1099_nec: list[Form1099NEC] = field(default_factory=list)
+    forms_1099_int: list[Form1099INT] = field(default_factory=list)
+    forms_1099_div: list[Form1099DIV] = field(default_factory=list)
+    forms_1099_b: list[Form1099B] = field(default_factory=list)
     schedule_k1s: list[ScheduleK1] = field(default_factory=list)
+
+    # Dependents
+    dependents: list[Dependent] = field(default_factory=list)
 
     # Businesses (Schedule C)
     businesses: list[ScheduleCData] = field(default_factory=list)
@@ -412,6 +504,11 @@ class TaxpayerProfile:
 
     # State
     has_colorado_filing_obligation: bool = False  # Evaluate based on rental property
+    co_tabor_refund: float = 0.0
+    co_pension_income: float = 0.0
+    taxpayer_age: int = 0
+    uses_itemized_deductions: bool = False
+    state_local_tax_deduction: float = 0.0
 
     def __post_init__(self):
         if self.ssn:

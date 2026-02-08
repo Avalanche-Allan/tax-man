@@ -26,14 +26,11 @@
 - [x] `inspect_form_fields` uses clean single iteration (was redundant logic)
 
 ### Testing (Phase 2)
-- [x] 218 tests across 7 test files + fixtures
-- [x] Calculator tests (~60): brackets, SE tax, QBI, FEIE, NIIT, quarterly estimates
-- [x] Model tests (~40): validation, properties, edge cases
-- [x] Validation tests (~30): TIN, EIN, ranges, percentages
-- [x] Parser tests (~25): document classification, amount extraction
-- [x] Integration tests (~20): full MFS/single/MFJ returns, consistency checks
-- [x] Colorado tests (~13): source income, Form 104, apportionment
-- [x] Fill forms tests (~5): paths, IRS URLs
+- [x] 287 tests across 4 test files + fixtures
+- [x] Calculator tests (122): brackets, SE tax, QBI, FEIE, NIIT, AMT, credits, investment income, Schedule D, K-1 all boxes
+- [x] Model tests (84): validation, properties, edge cases, parsing, form filling
+- [x] Integration tests (61): full MFS/single/MFJ returns, consistency checks
+- [x] Colorado tests (20): source income, Form 104, apportionment, SALT addback, pension/TABOR
 
 ### Document Parsing (Phase 3)
 - [x] `ParseResult` wrapper with confidence, warnings, needs_manual_review
@@ -58,6 +55,16 @@
 - [x] Common formatting helpers (SSN, EIN, currency for PDF, checkboxes)
 - [x] `generate_all_forms()` orchestration pipeline
 
+### Engine Enhancements (Phase 7)
+- [x] Home office regular method: mortgage interest + real estate taxes prorated by business %
+- [x] Investment income: Form 1099-INT/DIV/B models, Lines 2a/2b/3a/3b/7 on 1040
+- [x] Schedule D: capital gains/losses from 1099-B, K-1 Boxes 8/9a/10, 1099-DIV Box 2a; loss limitation ($3,000 / $1,500 MFS)
+- [x] K-1 all boxes: Boxes 3, 6a/6b, 7, 8, 10, 11, 12, 13 handled in `calculate_schedule_e()`
+- [x] QBI cap: IRC §199A(a) reduces by net capital gain (incl. qualified dividends)
+- [x] Colorado Form 104: SALT addback for itemizers, TABOR subtraction, age-based pension subtraction
+- [x] AMT (Form 6251): exemption with phaseout, 26%/28% rates, integrated into total_tax
+- [x] Credits (Schedule 8812): CTC $2,500/child (OBBBA), ODC $500, ACTC refundable — with phaseout
+
 ---
 
 ## Remaining
@@ -71,8 +78,11 @@
 - [ ] **Parse prior returns** — 2023 and 2024 for comparison and safe harbor calculation
 - [ ] **Verify OBBBA constants** — cross-check against final IRS publications (Pub 17, form instructions) when released
 
-### Forms Not Yet Implemented
+### Forms Not Yet Implemented (PDF field mappings)
 
+- [ ] Schedule D — calculation exists but no PDF mapping
+- [ ] Form 6251 (AMT) — calculation exists but no PDF mapping
+- [ ] Schedule 8812 (CTC/ACTC) — calculation exists but no PDF mapping
 - [ ] Form 7206 (SE health insurance deduction) — calculation exists but no PDF mapping
 - [ ] Form 8829 (regular method home office) — if regular method chosen over simplified
 - [ ] Form 4562 (depreciation) — if equipment purchases need Section 179
@@ -81,6 +91,10 @@
 
 ### Nice to Have
 
+- [ ] Capital gains preferential rates (qualified dividends/LTCG at 0%/15%/20%)
+- [ ] Schedule A (itemized deductions)
+- [ ] EITC (stub exists — MFS disqualified)
+- [ ] Schedule B form generation (threshold tracking only)
 - [ ] QBI loss carryforward tracking across tax years
 - [ ] Suspended passive loss carryforward tracking
 - [ ] MeF e-file XML generation (if feasible)

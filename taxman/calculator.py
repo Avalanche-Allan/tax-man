@@ -12,6 +12,29 @@ from taxman.constants import (
     ADDITIONAL_MEDICARE_THRESHOLD_MFS,
     ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
     ADDITIONAL_MEDICARE_THRESHOLD_SINGLE,
+    AMT_BREAKPOINT_MFS,
+    AMT_BREAKPOINT_OTHER,
+    AMT_EXEMPTION_MFJ,
+    AMT_EXEMPTION_MFS,
+    AMT_EXEMPTION_SINGLE,
+    AMT_EXEMPTION_HOH,
+    AMT_PHASEOUT_MFJ,
+    AMT_PHASEOUT_MFS,
+    AMT_PHASEOUT_SINGLE,
+    AMT_PHASEOUT_HOH,
+    AMT_PHASEOUT_RATE,
+    AMT_RATE_HIGH,
+    AMT_RATE_LOW,
+    ACTC_EARNED_INCOME_RATE,
+    ACTC_EARNED_INCOME_THRESHOLD,
+    ACTC_REFUNDABLE_PER_CHILD,
+    CAPITAL_LOSS_LIMIT_MFS,
+    CAPITAL_LOSS_LIMIT_OTHER,
+    CTC_AMOUNT_PER_CHILD,
+    CTC_PHASEOUT_MFJ,
+    CTC_PHASEOUT_OTHER,
+    CTC_PHASEOUT_RATE,
+    ODC_AMOUNT,
     ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS,
     ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_SINGLE,
     ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFJ,
@@ -92,6 +115,38 @@ ESTIMATED_TAX_HIGH_INCOME_THRESHOLDS = {
 }
 
 
+AMT_EXEMPTIONS = {
+    FilingStatus.SINGLE: AMT_EXEMPTION_SINGLE,
+    FilingStatus.MFS: AMT_EXEMPTION_MFS,
+    FilingStatus.MFJ: AMT_EXEMPTION_MFJ,
+    FilingStatus.HOH: AMT_EXEMPTION_HOH,
+    FilingStatus.QSS: AMT_EXEMPTION_MFJ,
+}
+
+AMT_PHASEOUTS = {
+    FilingStatus.SINGLE: AMT_PHASEOUT_SINGLE,
+    FilingStatus.MFS: AMT_PHASEOUT_MFS,
+    FilingStatus.MFJ: AMT_PHASEOUT_MFJ,
+    FilingStatus.HOH: AMT_PHASEOUT_HOH,
+    FilingStatus.QSS: AMT_PHASEOUT_MFJ,
+}
+
+AMT_BREAKPOINTS = {
+    FilingStatus.SINGLE: AMT_BREAKPOINT_OTHER,
+    FilingStatus.MFS: AMT_BREAKPOINT_MFS,
+    FilingStatus.MFJ: AMT_BREAKPOINT_OTHER,
+    FilingStatus.HOH: AMT_BREAKPOINT_OTHER,
+    FilingStatus.QSS: AMT_BREAKPOINT_OTHER,
+}
+
+CAPITAL_LOSS_LIMITS = {
+    FilingStatus.SINGLE: CAPITAL_LOSS_LIMIT_OTHER,
+    FilingStatus.MFS: CAPITAL_LOSS_LIMIT_MFS,
+    FilingStatus.MFJ: CAPITAL_LOSS_LIMIT_OTHER,
+    FilingStatus.HOH: CAPITAL_LOSS_LIMIT_OTHER,
+    FilingStatus.QSS: CAPITAL_LOSS_LIMIT_OTHER,
+}
+
 # =============================================================================
 # Calculation Result Containers
 # =============================================================================
@@ -135,13 +190,22 @@ class ScheduleSEResult:
 @dataclass
 class ScheduleEResult:
     """Calculated Schedule E (rental/K-1 income)."""
-    net_rental_income: float = 0.0      # Box 2 rental income
+    net_rental_income: float = 0.0      # Box 2 + Box 3 rental income
     ordinary_business_income: float = 0.0  # Box 1
     guaranteed_payments: float = 0.0    # Box 4
     interest_income: float = 0.0        # Box 5
+    dividends: float = 0.0             # Box 6a
+    qualified_dividends: float = 0.0   # Box 6b
+    royalties: float = 0.0            # Box 7
+    net_st_capital_gain: float = 0.0   # Box 8
     capital_gains: float = 0.0          # Box 9a
+    net_section_1231_gain: float = 0.0 # Box 10
+    other_income: float = 0.0         # Box 11
+    section_179_deduction: float = 0.0 # Box 12
+    other_deductions: float = 0.0     # Box 13
     se_earnings_from_k1: float = 0.0    # Box 14 (subject to SE tax)
-    total_schedule_e_income: float = 0.0  # All K-1 income combined
+    total_schedule_e_income: float = 0.0  # All K-1 income for Schedule 1
+    warnings: list[str] = field(default_factory=list)
     lines: list[LineItem] = field(default_factory=list)
 
 
@@ -151,6 +215,41 @@ class Form8995Result:
     total_qbi: float = 0.0
     qbi_deduction: float = 0.0
     is_limited: bool = False
+    lines: list[LineItem] = field(default_factory=list)
+
+
+@dataclass
+class ScheduleDResult:
+    """Calculated Schedule D (Capital Gains and Losses)."""
+    net_st_gain_loss: float = 0.0
+    net_lt_gain_loss: float = 0.0
+    net_capital_gain_loss: float = 0.0
+    capital_gain_for_1040: float = 0.0  # Loss limited by filing status
+    lines: list[LineItem] = field(default_factory=list)
+
+
+@dataclass
+class Form6251Result:
+    """Calculated AMT (Form 6251)."""
+    amti: float = 0.0                    # Alternative minimum taxable income
+    exemption: float = 0.0               # AMT exemption (after phaseout)
+    tentative_minimum_tax: float = 0.0   # TMT
+    amt: float = 0.0                     # AMT = max(TMT - regular tax, 0)
+    lines: list[LineItem] = field(default_factory=list)
+
+
+@dataclass
+class TaxCreditsResult:
+    """Calculated tax credits (CTC, ACTC, ODC)."""
+    ctc_per_child: float = 0.0
+    num_qualifying_children: int = 0
+    num_other_dependents: int = 0
+    gross_ctc: float = 0.0            # Before phaseout
+    gross_odc: float = 0.0
+    phaseout_reduction: float = 0.0
+    total_credit_after_phaseout: float = 0.0
+    nonrefundable_credit: float = 0.0  # Limited to tax liability
+    refundable_actc: float = 0.0       # Additional Child Tax Credit
     lines: list[LineItem] = field(default_factory=list)
 
 
@@ -171,6 +270,11 @@ class Form1040Result:
     """Complete calculated Form 1040."""
     # Income
     wage_income: float = 0.0           # Line 1a (W-2 wages)
+    tax_exempt_interest: float = 0.0   # Line 2a (informational)
+    taxable_interest: float = 0.0      # Line 2b
+    qualified_dividends: float = 0.0   # Line 3a
+    ordinary_dividends: float = 0.0    # Line 3b
+    capital_gain_loss: float = 0.0     # Line 7
     total_income: float = 0.0          # Line 9
     adjustments: float = 0.0           # Line 10
     agi: float = 0.0                   # Line 11
@@ -182,6 +286,8 @@ class Form1040Result:
     se_tax: float = 0.0               # Schedule 2
     additional_medicare: float = 0.0   # Schedule 2
     niit: float = 0.0                  # Schedule 2 (Net Investment Income Tax)
+    amt: float = 0.0                  # Schedule 2 (Alternative Minimum Tax)
+    nonrefundable_credits: float = 0.0  # Line 21 (CTC + ODC nonrefundable)
     total_tax: float = 0.0            # Line 24
     # Payments
     total_payments: float = 0.0        # Line 33
@@ -194,6 +300,9 @@ class Form1040Result:
     schedule_c_results: list[ScheduleCResult] = field(default_factory=list)
     schedule_se: Optional[ScheduleSEResult] = None
     schedule_e: Optional[ScheduleEResult] = None
+    schedule_d: Optional[ScheduleDResult] = None
+    form_6251: Optional[Form6251Result] = None
+    tax_credits: Optional[TaxCreditsResult] = None
     qbi: Optional[Form8995Result] = None
     feie: Optional[Form2555Result] = None
     lines: list[LineItem] = field(default_factory=list)
@@ -399,20 +508,28 @@ def calculate_schedule_e(profile: TaxpayerProfile) -> ScheduleEResult:
         # Box 2: Net rental income (passive)
         rental = k1.net_rental_income
         if rental < 0 and profile.filing_status == FilingStatus.MFS:
-            # MFS: passive rental losses suspended (no $25K allowance)
             lines.append(LineItem("Schedule E", "Part II",
                                   f"K-1 rental loss from {k1.partnership_name} (SUSPENDED)",
                                   0.0,
                                   f"Actual loss: ${rental:,.2f}. MFS filers get $0 passive "
                                   f"loss allowance (IRC §469(i)(5)(B)). Loss is suspended "
                                   f"and carries forward."))
-            # Don't add to income — loss is suspended
         else:
             result.net_rental_income += rental
             lines.append(LineItem("Schedule E", "Part II",
                                   f"K-1 rental income from {k1.partnership_name}",
                                   round(rental, 2),
                                   "Net rental income from partnership K-1, Box 2"))
+
+        # Box 3: Other net rental income
+        rental3 = k1.other_net_rental_income
+        if rental3 < 0 and profile.filing_status == FilingStatus.MFS:
+            pass  # Suspended same as Box 2
+        elif rental3 != 0:
+            result.net_rental_income += rental3
+            lines.append(LineItem("Schedule E", "K-1 Box 3",
+                                  f"Other net rental income from {k1.partnership_name}",
+                                  round(rental3, 2)))
 
         # Box 1: Ordinary business income
         if k1.ordinary_business_income != 0:
@@ -429,13 +546,44 @@ def calculate_schedule_e(profile: TaxpayerProfile) -> ScheduleEResult:
                                   round(k1.guaranteed_payments, 2),
                                   "Subject to self-employment tax"))
 
-        # Box 5: Interest income (flows to Schedule B / 1040 Line 2b)
+        # Box 5: Interest income (flows to Line 2b)
         if k1.interest_income > 0:
             result.interest_income += k1.interest_income
             lines.append(LineItem("Schedule E", "K-1 Box 5",
                                   f"Interest income from {k1.partnership_name}",
                                   round(k1.interest_income, 2),
-                                  "Flows to Schedule B / Form 1040 Line 2b"))
+                                  "Flows to Form 1040 Line 2b"))
+
+        # Box 6a: Dividends (flows to Line 3b)
+        if k1.dividends != 0:
+            result.dividends += k1.dividends
+            lines.append(LineItem("Schedule E", "K-1 Box 6a",
+                                  f"Dividends from {k1.partnership_name}",
+                                  round(k1.dividends, 2),
+                                  "Flows to Form 1040 Line 3b"))
+
+        # Box 6b: Qualified dividends (flows to Line 3a)
+        if hasattr(k1, 'qualified_dividends') and k1.qualified_dividends != 0:
+            result.qualified_dividends += k1.qualified_dividends
+            lines.append(LineItem("Schedule E", "K-1 Box 6b",
+                                  f"Qualified dividends from {k1.partnership_name}",
+                                  round(k1.qualified_dividends, 2),
+                                  "Flows to Form 1040 Line 3a"))
+
+        # Box 7: Royalties (Schedule E + NII)
+        if k1.royalties != 0:
+            result.royalties += k1.royalties
+            lines.append(LineItem("Schedule E", "K-1 Box 7",
+                                  f"Royalties from {k1.partnership_name}",
+                                  round(k1.royalties, 2)))
+
+        # Box 8: Net short-term capital gain (flows to Schedule D)
+        if k1.net_short_term_capital_gain != 0:
+            result.net_st_capital_gain += k1.net_short_term_capital_gain
+            lines.append(LineItem("Schedule E", "K-1 Box 8",
+                                  f"Net ST capital gain from {k1.partnership_name}",
+                                  round(k1.net_short_term_capital_gain, 2),
+                                  "Flows to Schedule D"))
 
         # Box 9a: Net long-term capital gain (flows to Schedule D)
         if k1.net_long_term_capital_gain != 0:
@@ -445,6 +593,35 @@ def calculate_schedule_e(profile: TaxpayerProfile) -> ScheduleEResult:
                                   round(k1.net_long_term_capital_gain, 2),
                                   "Flows to Schedule D"))
 
+        # Box 10: Net section 1231 gain (treated as LTCG for Schedule D)
+        if k1.net_section_1231_gain != 0:
+            result.net_section_1231_gain += k1.net_section_1231_gain
+            lines.append(LineItem("Schedule E", "K-1 Box 10",
+                                  f"Net §1231 gain from {k1.partnership_name}",
+                                  round(k1.net_section_1231_gain, 2),
+                                  "Treated as LTCG, flows to Schedule D"))
+
+        # Box 11: Other income
+        if k1.other_income != 0:
+            result.other_income += k1.other_income
+            lines.append(LineItem("Schedule E", "K-1 Box 11",
+                                  f"Other income from {k1.partnership_name}",
+                                  round(k1.other_income, 2)))
+
+        # Box 12: Section 179 deduction
+        if k1.section_179_deduction != 0:
+            result.section_179_deduction += k1.section_179_deduction
+            lines.append(LineItem("Schedule E", "K-1 Box 12",
+                                  f"§179 deduction from {k1.partnership_name}",
+                                  round(k1.section_179_deduction, 2)))
+
+        # Box 13: Other deductions
+        if k1.other_deductions != 0:
+            result.other_deductions += k1.other_deductions
+            lines.append(LineItem("Schedule E", "K-1 Box 13",
+                                  f"Other deductions from {k1.partnership_name}",
+                                  round(k1.other_deductions, 2)))
+
         # Box 14: Self-employment earnings
         if k1.self_employment_earnings != 0:
             result.se_earnings_from_k1 += k1.self_employment_earnings
@@ -453,15 +630,72 @@ def calculate_schedule_e(profile: TaxpayerProfile) -> ScheduleEResult:
                                   round(k1.self_employment_earnings, 2),
                                   "Added to Schedule SE calculation"))
 
-    # Total all Schedule E income
+    # Total Schedule E income for Schedule 1
+    # Excludes dividends/cap gains (they flow to Lines 3b/7 directly)
     result.total_schedule_e_income = round(
         result.net_rental_income + result.ordinary_business_income
         + result.guaranteed_payments + result.interest_income
-        + result.capital_gains, 2
+        + result.capital_gains + result.royalties + result.other_income
+        - result.section_179_deduction - result.other_deductions, 2
     )
     lines.append(LineItem("Schedule E", "26",
                           "Total Schedule E income",
                           result.total_schedule_e_income))
+
+    result.lines = lines
+    return result
+
+
+def calculate_schedule_d(profile: TaxpayerProfile,
+                         filing_status: FilingStatus) -> ScheduleDResult:
+    """Calculate Schedule D (Capital Gains and Losses).
+
+    Aggregates capital gains/losses from 1099-B, K-1 Boxes 8/9a/10,
+    and 1099-DIV Box 2a (capital gain distributions).
+    Applies capital loss limitation ($1,500 MFS / $3,000 other).
+    """
+    result = ScheduleDResult()
+    lines = []
+
+    net_st = 0.0
+    net_lt = 0.0
+
+    # 1099-B: broker transactions
+    for b in profile.forms_1099_b:
+        net_st += b.net_st_gain_loss
+        net_lt += b.net_lt_gain_loss
+
+    # K-1 boxes
+    for k1 in profile.schedule_k1s:
+        net_st += k1.net_short_term_capital_gain     # Box 8
+        net_lt += k1.net_long_term_capital_gain       # Box 9a
+        net_lt += k1.net_section_1231_gain            # Box 10 → treated as LTCG
+
+    # 1099-DIV Box 2a: capital gain distributions → LT
+    for div in profile.forms_1099_div:
+        net_lt += div.capital_gain_distributions
+
+    result.net_st_gain_loss = round(net_st, 2)
+    result.net_lt_gain_loss = round(net_lt, 2)
+    result.net_capital_gain_loss = round(net_st + net_lt, 2)
+
+    if net_st != 0:
+        lines.append(LineItem("Schedule D", "7", "Net short-term capital gain/loss",
+                              result.net_st_gain_loss))
+    if net_lt != 0:
+        lines.append(LineItem("Schedule D", "15", "Net long-term capital gain/loss",
+                              result.net_lt_gain_loss))
+
+    # Apply capital loss limitation
+    net = result.net_capital_gain_loss
+    if net >= 0:
+        result.capital_gain_for_1040 = net
+    else:
+        loss_limit = CAPITAL_LOSS_LIMITS.get(filing_status, CAPITAL_LOSS_LIMIT_OTHER)
+        result.capital_gain_for_1040 = round(max(net, -loss_limit), 2)
+
+    lines.append(LineItem("Schedule D", "21", "Capital gain/loss for 1040 Line 7",
+                          result.capital_gain_for_1040))
 
     result.lines = lines
     return result
@@ -476,6 +710,7 @@ def calculate_qbi_deduction(
     k1_qbi: float = 0.0,
     k1_w2_wages: float = 0.0,
     k1_ubia: float = 0.0,
+    net_capital_gain: float = 0.0,
 ) -> Form8995Result:
     """Calculate QBI deduction (Form 8995/8995-A).
 
@@ -517,9 +752,11 @@ def calculate_qbi_deduction(
     )
 
     if taxable_income_before_qbi <= threshold:
-        # Simple: 20% of QBI, capped at 20% of taxable income
+        # Simple: 20% of QBI, capped at 20% of (taxable income - net capital gain)
+        # IRC §199A(a): net capital gain includes qualified dividends
         qbi_deduction = total_qbi * QBI_DEDUCTION_RATE
-        max_deduction = taxable_income_before_qbi * QBI_DEDUCTION_RATE
+        taxable_for_qbi_cap = max(taxable_income_before_qbi - net_capital_gain, 0)
+        max_deduction = taxable_for_qbi_cap * QBI_DEDUCTION_RATE
         qbi_deduction = min(qbi_deduction, max_deduction)
         result.qbi_deduction = round(qbi_deduction, 2)
         result.is_limited = False
@@ -612,6 +849,141 @@ def calculate_niit(
     agi_excess = max(agi - threshold, 0)
     taxable_nii = min(net_investment_income, agi_excess)
     return round(taxable_nii * NIIT_RATE, 2)
+
+
+def calculate_amt(
+    taxable_income: float,
+    regular_tax: float,
+    filing_status: FilingStatus,
+    salt_deduction: float = 0.0,
+    other_amt_adjustments: float = 0.0,
+) -> Form6251Result:
+    """Calculate Alternative Minimum Tax (Form 6251).
+
+    AMTI = taxable income + SALT addback + other adjustments.
+    Exemption phases out at 25 cents per dollar above threshold.
+    TMT = 26% of first $239,100 ($119,550 MFS) + 28% of remainder.
+    AMT = max(TMT - regular tax, 0).
+    """
+    result = Form6251Result()
+    lines = []
+
+    # AMTI
+    amti = taxable_income + salt_deduction + other_amt_adjustments
+    result.amti = round(amti, 2)
+    lines.append(LineItem("Form 6251", "7", "AMTI",
+                          result.amti))
+
+    # Exemption with phaseout
+    base_exemption = AMT_EXEMPTIONS.get(filing_status, AMT_EXEMPTION_MFS)
+    phaseout_start = AMT_PHASEOUTS.get(filing_status, AMT_PHASEOUT_MFS)
+
+    if amti <= phaseout_start:
+        exemption = base_exemption
+    else:
+        reduction = (amti - phaseout_start) * AMT_PHASEOUT_RATE
+        exemption = max(base_exemption - reduction, 0)
+
+    result.exemption = round(exemption, 2)
+    lines.append(LineItem("Form 6251", "13", "AMT exemption",
+                          result.exemption))
+
+    # AMT taxable excess
+    amt_taxable = max(amti - exemption, 0)
+
+    # TMT: 26%/28% rates
+    breakpoint = AMT_BREAKPOINTS.get(filing_status, AMT_BREAKPOINT_OTHER)
+    if amt_taxable <= breakpoint:
+        tmt = amt_taxable * AMT_RATE_LOW
+    else:
+        tmt = breakpoint * AMT_RATE_LOW + (amt_taxable - breakpoint) * AMT_RATE_HIGH
+
+    result.tentative_minimum_tax = round(tmt, 2)
+    lines.append(LineItem("Form 6251", "14", "Tentative minimum tax",
+                          result.tentative_minimum_tax))
+
+    # AMT = max(TMT - regular tax, 0)
+    result.amt = round(max(tmt - regular_tax, 0), 2)
+    lines.append(LineItem("Form 6251", "15", "AMT",
+                          result.amt))
+
+    result.lines = lines
+    return result
+
+
+def calculate_tax_credits(
+    profile: TaxpayerProfile,
+    agi: float,
+    tax_liability: float,
+    earned_income: float,
+) -> TaxCreditsResult:
+    """Calculate CTC, ACTC, and ODC.
+
+    CTC: $2,500 per qualifying child (OBBBA 2025).
+    ODC: $500 per other dependent.
+    Phaseout: $50 per $1,000 excess MAGI over threshold ($400K MFJ, $200K other).
+    Nonrefundable portion limited to tax liability.
+    ACTC refundable: min(unused CTC, $1,700/child, 15% of (earned income - $2,500)).
+    EITC: $0 for MFS filers (disqualified).
+    """
+    result = TaxCreditsResult()
+    lines = []
+
+    qualifying_children = [d for d in profile.dependents if d.is_qualifying_child_ctc]
+    other_dependents = [d for d in profile.dependents if not d.is_qualifying_child_ctc]
+    result.num_qualifying_children = len(qualifying_children)
+    result.num_other_dependents = len(other_dependents)
+
+    if not profile.dependents:
+        result.lines = lines
+        return result
+
+    # Gross credits
+    result.ctc_per_child = CTC_AMOUNT_PER_CHILD
+    result.gross_ctc = len(qualifying_children) * CTC_AMOUNT_PER_CHILD
+    result.gross_odc = len(other_dependents) * ODC_AMOUNT
+    gross_total = result.gross_ctc + result.gross_odc
+
+    lines.append(LineItem("Schedule 8812", "4",
+                          f"CTC: {len(qualifying_children)} children × ${CTC_AMOUNT_PER_CHILD:,}",
+                          result.gross_ctc))
+    if result.gross_odc > 0:
+        lines.append(LineItem("Schedule 8812", "5",
+                              f"ODC: {len(other_dependents)} dependents × ${ODC_AMOUNT}",
+                              result.gross_odc))
+
+    # Phaseout
+    fs = profile.filing_status
+    threshold = CTC_PHASEOUT_MFJ if fs in (FilingStatus.MFJ, FilingStatus.QSS) else CTC_PHASEOUT_OTHER
+    excess = max(agi - threshold, 0)
+    # Round up to next $1,000
+    thousands_excess = -(-excess // 1_000)  # ceiling division
+    result.phaseout_reduction = thousands_excess * CTC_PHASEOUT_RATE
+
+    result.total_credit_after_phaseout = max(gross_total - result.phaseout_reduction, 0)
+
+    # Nonrefundable portion: limited to tax liability
+    result.nonrefundable_credit = min(result.total_credit_after_phaseout, tax_liability)
+    lines.append(LineItem("Schedule 8812", "14",
+                          "Nonrefundable credit",
+                          result.nonrefundable_credit))
+
+    # ACTC refundable: only for CTC (not ODC)
+    unused_ctc = max(
+        min(result.gross_ctc, result.total_credit_after_phaseout) - result.nonrefundable_credit,
+        0,
+    )
+    if unused_ctc > 0 and len(qualifying_children) > 0:
+        actc_per_child_cap = len(qualifying_children) * ACTC_REFUNDABLE_PER_CHILD
+        earned_income_amount = max(earned_income - ACTC_EARNED_INCOME_THRESHOLD, 0) * ACTC_EARNED_INCOME_RATE
+        result.refundable_actc = round(min(unused_ctc, actc_per_child_cap, earned_income_amount), 2)
+        if result.refundable_actc > 0:
+            lines.append(LineItem("Schedule 8812", "27",
+                                  "Additional Child Tax Credit (refundable)",
+                                  result.refundable_actc))
+
+    result.lines = lines
+    return result
 
 
 def evaluate_feie(
@@ -729,13 +1101,65 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
         # K-1 SE earnings (Box 14 / guaranteed payments) feed into SE tax
         k1_se_income = sch_e.se_earnings_from_k1 + sch_e.guaranteed_payments
 
-        # Rental income is net investment income for NIIT
-        net_investment_income += max(sch_e.net_rental_income, 0)
-        net_investment_income += sch_e.interest_income
-        net_investment_income += max(sch_e.capital_gains, 0)
-
-        # All K-1 income flows to Schedule 1
+        # All K-1 income flows to Schedule 1 initially
         k1_other_income = sch_e.total_schedule_e_income
+        # Subtract pieces that flow to Lines 2b/3b/7 instead of Schedule 1
+        k1_other_income -= sch_e.interest_income
+        k1_other_income -= sch_e.capital_gains
+
+    # ─── INVESTMENT INCOME (Lines 2-7) ────────────────────────
+    # Line 2a: Tax-exempt interest (informational)
+    tax_exempt_interest = sum(f.tax_exempt_interest for f in profile.forms_1099_int)
+    result.tax_exempt_interest = round(tax_exempt_interest, 2)
+
+    # Line 2b: Taxable interest (1099-INT Box 1 + K-1 Box 5)
+    taxable_interest = (
+        sum(f.interest_income for f in profile.forms_1099_int)
+        + (sch_e.interest_income if sch_e else 0.0)
+    )
+    result.taxable_interest = round(taxable_interest, 2)
+
+    # Line 3a: Qualified dividends (1099-DIV Box 1b + K-1 Box 6b)
+    qualified_dividends = (
+        sum(f.qualified_dividends for f in profile.forms_1099_div)
+        + (sch_e.qualified_dividends if sch_e else 0.0)
+    )
+    result.qualified_dividends = round(qualified_dividends, 2)
+
+    # Line 3b: Ordinary dividends (1099-DIV Box 1a + K-1 Box 6a)
+    ordinary_dividends = (
+        sum(f.ordinary_dividends for f in profile.forms_1099_div)
+        + (sch_e.dividends if sch_e else 0.0)
+    )
+    result.ordinary_dividends = round(ordinary_dividends, 2)
+    # Subtract K-1 dividends from k1_other_income (they flow to Line 3b, not Sch 1)
+    if sch_e:
+        k1_other_income -= sch_e.dividends
+
+    # Schedule D / Line 7: Capital gains and losses
+    has_cap_activity = (
+        profile.forms_1099_b
+        or any(k1.net_short_term_capital_gain != 0 or k1.net_long_term_capital_gain != 0
+               or k1.net_section_1231_gain != 0 for k1 in profile.schedule_k1s)
+        or any(f.capital_gain_distributions > 0 for f in profile.forms_1099_div)
+    )
+    sch_d = None
+    if has_cap_activity:
+        sch_d = calculate_schedule_d(profile, fs)
+        result.schedule_d = sch_d
+        result.capital_gain_loss = sch_d.capital_gain_for_1040
+        # Subtract K-1 capital gains from k1_other_income (they flow through Sch D)
+        if sch_e:
+            k1_other_income -= sch_e.capital_gains
+
+    # Net investment income for NIIT
+    net_investment_income += max(taxable_interest, 0)
+    net_investment_income += max(ordinary_dividends, 0)
+    if sch_d and sch_d.net_capital_gain_loss > 0:
+        net_investment_income += sch_d.net_capital_gain_loss
+    if sch_e:
+        net_investment_income += max(sch_e.net_rental_income, 0)
+        net_investment_income += max(sch_e.royalties, 0)
 
     # ─── SCHEDULE SE ───────────────────────────────────────────
     # SE income = Schedule C profits + K-1 SE earnings
@@ -755,13 +1179,37 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
         lines.append(LineItem("Form 1040", "1a", "Wages, salaries, tips",
                               result.wage_income))
 
-    # Schedule 1 income: business + K-1
+    # Lines 2a/2b
+    if result.tax_exempt_interest > 0:
+        lines.append(LineItem("Form 1040", "2a", "Tax-exempt interest",
+                              result.tax_exempt_interest))
+    if result.taxable_interest > 0:
+        lines.append(LineItem("Form 1040", "2b", "Taxable interest",
+                              result.taxable_interest))
+
+    # Lines 3a/3b
+    if result.qualified_dividends > 0:
+        lines.append(LineItem("Form 1040", "3a", "Qualified dividends",
+                              result.qualified_dividends))
+    if result.ordinary_dividends > 0:
+        lines.append(LineItem("Form 1040", "3b", "Ordinary dividends",
+                              result.ordinary_dividends))
+
+    # Line 7
+    if result.capital_gain_loss != 0:
+        lines.append(LineItem("Form 1040", "7", "Capital gain or (loss)",
+                              result.capital_gain_loss))
+
+    # Schedule 1 income: business + K-1 (non-investment portions)
     schedule_1_income = total_business_income + k1_other_income
     lines.append(LineItem("Form 1040", "8",
                           "Other income (Schedule 1)",
                           round(schedule_1_income, 2)))
 
-    result.total_income = round(wages + schedule_1_income, 2)
+    result.total_income = round(
+        wages + taxable_interest + ordinary_dividends
+        + result.capital_gain_loss + schedule_1_income, 2
+    )
     lines.append(LineItem("Form 1040", "9", "Total income",
                           result.total_income))
 
@@ -819,9 +1267,14 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
     k1_ubia = sum(k1.qbi_ubia for k1 in profile.schedule_k1s if not k1.is_sstb)
 
     taxable_before_qbi = max(result.agi - result.deduction, 0)
+    # Net capital gain for §199A cap includes qualified dividends
+    qbi_net_cap_gain = (
+        max(result.schedule_d.net_capital_gain_loss, 0) if result.schedule_d else 0.0
+    ) + qualified_dividends
     qbi_result = calculate_qbi_deduction(
         taxable_before_qbi, result.schedule_c_results, fs,
         k1_qbi=k1_qbi, k1_w2_wages=k1_w2_wages, k1_ubia=k1_ubia,
+        net_capital_gain=qbi_net_cap_gain,
     )
     result.qbi = qbi_result
     result.qbi_deduction = qbi_result.qbi_deduction
@@ -872,25 +1325,67 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                                   result.niit,
                                   f"On ${net_investment_income:,.2f} net investment income"))
 
+    # AMT (Form 6251) — only relevant for itemizers with SALT
+    salt_for_amt = profile.state_local_tax_deduction if profile.uses_itemized_deductions else 0.0
+    if salt_for_amt > 0:
+        amt_result = calculate_amt(
+            result.taxable_income, result.tax, fs,
+            salt_deduction=salt_for_amt,
+        )
+        result.amt = amt_result.amt
+        result.form_6251 = amt_result
+        if result.amt > 0:
+            lines.append(LineItem("Schedule 2", "1",
+                                  "Alternative Minimum Tax",
+                                  result.amt))
+
+    # ─── TAX CREDITS ─────────────────────────────────────────
+    # Earned income for ACTC: wages + SE income
+    earned_income_for_credits = wages + max(total_business_income, 0)
+    # Tax before credits = income tax + AMT (credits reduce this)
+    tax_before_credits = result.tax + result.amt
+    refundable_actc = 0.0
+
+    if profile.dependents:
+        credits_result = calculate_tax_credits(
+            profile, result.agi, tax_before_credits, earned_income_for_credits,
+        )
+        result.tax_credits = credits_result
+        result.nonrefundable_credits = credits_result.nonrefundable_credit
+        refundable_actc = credits_result.refundable_actc
+        if result.nonrefundable_credits > 0:
+            lines.append(LineItem("Form 1040", "19",
+                                  "Nonrefundable credits (CTC/ODC)",
+                                  result.nonrefundable_credits))
+
     # ─── TOTAL TAX ─────────────────────────────────────────────
     result.total_tax = round(
-        result.tax + result.se_tax + result.additional_medicare + result.niit, 2
+        result.tax + result.se_tax + result.additional_medicare
+        + result.niit + result.amt - result.nonrefundable_credits, 2
     )
+    result.total_tax = max(result.total_tax, 0)
     lines.append(LineItem("Form 1040", "24", "Total tax",
                           result.total_tax,
                           f"Income tax ${result.tax:,.2f} + "
                           f"SE tax ${result.se_tax:,.2f} + "
                           f"Addl Medicare ${result.additional_medicare:,.2f}"
-                          + (f" + NIIT ${result.niit:,.2f}" if result.niit else "")))
+                          + (f" + NIIT ${result.niit:,.2f}" if result.niit else "")
+                          + (f" + AMT ${result.amt:,.2f}" if result.amt else "")
+                          + (f" - credits ${result.nonrefundable_credits:,.2f}"
+                             if result.nonrefundable_credits else "")))
 
     # ─── PAYMENTS ──────────────────────────────────────────────
-    # W-2 federal income tax withheld (Line 25a)
-    result.withholding = round(
-        sum(w2.federal_tax_withheld for w2 in profile.forms_w2), 2
+    # Federal income tax withheld (Line 25)
+    w2_withholding = sum(w2.federal_tax_withheld for w2 in profile.forms_w2)
+    form_1099_withholding = (
+        sum(f.federal_tax_withheld for f in profile.forms_1099_int)
+        + sum(f.federal_tax_withheld for f in profile.forms_1099_div)
+        + sum(f.federal_tax_withheld for f in profile.forms_1099_b)
     )
+    result.withholding = round(w2_withholding + form_1099_withholding, 2)
     if result.withholding > 0:
         lines.append(LineItem("Form 1040", "25a",
-                              "Federal income tax withheld (W-2)",
+                              "Federal income tax withheld",
                               result.withholding))
 
     result.estimated_payments = profile.total_estimated_payments
@@ -900,8 +1395,12 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                               result.estimated_payments))
 
     result.total_payments = round(
-        result.withholding + result.estimated_payments, 2
+        result.withholding + result.estimated_payments + refundable_actc, 2
     )
+    if refundable_actc > 0:
+        lines.append(LineItem("Form 1040", "28",
+                              "Additional Child Tax Credit (refundable)",
+                              refundable_actc))
     lines.append(LineItem("Form 1040", "33", "Total payments",
                           result.total_payments))
 

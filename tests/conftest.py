@@ -3,6 +3,8 @@
 import pytest
 
 from tests.fixtures.profiles import (
+    make_family_profile,
+    make_investor_profile,
     make_mfs_expat_profile,
     make_single_freelancer_profile,
     make_mfj_high_income_profile,
@@ -39,3 +41,15 @@ def minimal_profile():
 def zero_income():
     """Zero income profile."""
     return make_zero_income_profile()
+
+
+@pytest.fixture
+def investor():
+    """Investor profile with 1099-INT/DIV/B."""
+    return make_investor_profile()
+
+
+@pytest.fixture
+def family():
+    """MFJ family with 2 children."""
+    return make_family_profile()

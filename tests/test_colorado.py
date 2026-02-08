@@ -179,3 +179,105 @@ class TestCalculateFullReturn:
         # CO source income reflects the actual loss
         co_source = calculate_co_source_income(profile)
         assert co_source == -5_000
+
+
+class TestColoradoAdditionsSubtractions:
+    def test_standard_deduction_no_salt_addback(self):
+        """Standard deduction filer has no SALT addback."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            uses_itemized_deductions=False,
+            businesses=[
+                ScheduleCData(business_name="Biz", gross_receipts=80_000),
+            ],
+        )
+        federal = calculate_return(profile)
+        co = calculate_colorado_104(federal, profile)
+        assert co.co_additions == 0
+
+    def test_itemizer_salt_addback(self):
+        """Itemizer with SALT should get addback."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            foreign_address=False,
+            state="CO",
+            uses_itemized_deductions=True,
+            state_local_tax_deduction=10_000,
+            businesses=[
+                ScheduleCData(business_name="Biz", gross_receipts=80_000),
+            ],
+        )
+        federal = calculate_return(profile)
+        co = calculate_colorado_104(federal, profile)
+        assert co.co_additions == 10_000
+
+    def test_tabor_subtraction(self):
+        """TABOR refund should be subtracted."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            foreign_address=False,
+            state="CO",
+            co_tabor_refund=800,
+            businesses=[
+                ScheduleCData(business_name="Biz", gross_receipts=80_000),
+            ],
+        )
+        federal = calculate_return(profile)
+        co = calculate_colorado_104(federal, profile)
+        assert co.co_subtractions == 800
+
+    def test_pension_subtraction_age_65(self):
+        """Age 65+ gets up to $24K pension subtraction."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            foreign_address=False,
+            state="CO",
+            taxpayer_age=67,
+            co_pension_income=30_000,
+            businesses=[
+                ScheduleCData(business_name="Biz", gross_receipts=50_000),
+            ],
+        )
+        federal = calculate_return(profile)
+        co = calculate_colorado_104(federal, profile)
+        assert co.co_subtractions == 24_000  # capped at $24K
+
+    def test_pension_subtraction_age_60(self):
+        """Age 55-64 gets up to $20K pension subtraction."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            foreign_address=False,
+            state="CO",
+            taxpayer_age=60,
+            co_pension_income=25_000,
+            businesses=[
+                ScheduleCData(business_name="Biz", gross_receipts=50_000),
+            ],
+        )
+        federal = calculate_return(profile)
+        co = calculate_colorado_104(federal, profile)
+        assert co.co_subtractions == 20_000  # capped at $20K
+
+    def test_pension_subtraction_under_55(self):
+        """Under 55 gets no pension subtraction."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            foreign_address=False,
+            state="CO",
+            taxpayer_age=50,
+            co_pension_income=25_000,
+            businesses=[
+                ScheduleCData(business_name="Biz", gross_receipts=50_000),
+            ],
+        )
+        federal = calculate_return(profile)
+        co = calculate_colorado_104(federal, profile)
+        assert co.co_subtractions == 0
+
+    def test_existing_tests_unchanged(self, co_profile):
+        """New fields default to 0 so existing profiles work unchanged."""
+        federal = calculate_return(co_profile)
+        co = calculate_colorado_104(federal, co_profile)
+        assert co.co_additions == 0
+        assert co.co_subtractions == 0
+        assert co.co_tax > 0

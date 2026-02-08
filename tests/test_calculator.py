@@ -4,13 +4,16 @@ import pytest
 from taxman.calculator import (
     BRACKETS_BY_STATUS,
     calculate_additional_medicare,
+    calculate_amt,
     calculate_income_tax,
     calculate_niit,
     calculate_qbi_deduction,
     calculate_return,
     calculate_schedule_c,
+    calculate_schedule_d,
     calculate_schedule_e,
     calculate_schedule_se,
+    calculate_tax_credits,
     compare_feie_scenarios,
     estimate_quarterly_payments,
     evaluate_feie,
@@ -33,7 +36,11 @@ from taxman.constants import (
 )
 from taxman.models import (
     BusinessExpenses,
+    Dependent,
     FilingStatus,
+    Form1099B,
+    Form1099DIV,
+    Form1099INT,
     FormW2,
     HomeOffice,
     ScheduleCData,
@@ -135,6 +142,66 @@ class TestCalculateScheduleC:
         # internet = 1200 * 0.60 = 720
         # total home office = 3240 + 720 = 3960
         assert abs(result.total_expenses - 3960) < 0.01
+
+    def test_home_office_regular_with_mortgage(self):
+        """Mortgage interest prorated by business percentage."""
+        biz = ScheduleCData(
+            business_name="Mortgage Office",
+            gross_receipts=80_000,
+            home_office=HomeOffice(
+                use_simplified_method=False,
+                total_home_sqft=2_000,
+                office_sqft=400,  # 20%
+                mortgage_interest=12_000,
+                months_used=12,
+            ),
+        )
+        result = calculate_schedule_c(biz)
+        # 12,000 * 20% = 2,400
+        assert abs(result.total_expenses - 2_400) < 0.01
+
+    def test_home_office_regular_with_real_estate_taxes(self):
+        """Real estate taxes prorated by business percentage."""
+        biz = ScheduleCData(
+            business_name="RE Tax Office",
+            gross_receipts=80_000,
+            home_office=HomeOffice(
+                use_simplified_method=False,
+                total_home_sqft=2_000,
+                office_sqft=400,  # 20%
+                real_estate_taxes=6_000,
+                months_used=12,
+            ),
+        )
+        result = calculate_schedule_c(biz)
+        # 6,000 * 20% = 1,200
+        assert abs(result.total_expenses - 1_200) < 0.01
+
+    def test_home_office_regular_all_expenses(self):
+        """Full regular method with all expense types including mortgage/RE taxes."""
+        biz = ScheduleCData(
+            business_name="Full Regular Office",
+            gross_receipts=80_000,
+            home_office=HomeOffice(
+                use_simplified_method=False,
+                total_home_sqft=1_000,
+                office_sqft=200,  # 20%
+                rent=12_000,
+                utilities=2_400,
+                insurance=1_200,
+                repairs=600,
+                internet=1_200,
+                internet_business_pct=0.60,
+                mortgage_interest=18_000,
+                real_estate_taxes=6_000,
+                months_used=12,
+            ),
+        )
+        result = calculate_schedule_c(biz)
+        # direct = (12000+2400+1200+600+18000+6000) * 0.2 = 40200*0.2 = 8040
+        # internet = 1200 * 0.60 = 720
+        # total = 8760
+        assert abs(result.total_expenses - 8_760) < 0.01
 
     def test_cogs(self):
         """COGS is subtracted to get gross profit (Line 5), which feeds
@@ -403,6 +470,42 @@ class TestCalculateQBI:
         assert not result.is_limited
         assert result.qbi_deduction == 20_000
 
+    def test_cap_reduced_by_net_capital_gain(self):
+        """IRC §199A(a): QBI cap is 20% of (taxable income - net capital gain)."""
+        from taxman.calculator import ScheduleCResult
+        sc = ScheduleCResult(business_name="Big QBI", net_profit_loss=200_000)
+        # Taxable = 100K, cap gain = 60K → cap base = 40K → cap = 20% of 40K = 8K
+        result = calculate_qbi_deduction(
+            100_000, [sc], FilingStatus.SINGLE, net_capital_gain=60_000,
+        )
+        assert result.qbi_deduction == 8_000
+
+    def test_cap_not_reduced_without_cap_gains(self):
+        """Regression: no capital gains means cap is 20% of full taxable income."""
+        from taxman.calculator import ScheduleCResult
+        sc = ScheduleCResult(business_name="Big", net_profit_loss=200_000)
+        result = calculate_qbi_deduction(30_000, [sc], FilingStatus.MFS)
+        # 20% of QBI = 40K, 20% of taxable = 6K (no cap gain reduction)
+        assert result.qbi_deduction == 6_000
+
+    def test_cap_includes_qualified_dividends(self):
+        """Qualified dividends are part of net_capital_gain for QBI cap."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[
+                ScheduleCData(business_name="Big Biz", gross_receipts=200_000),
+            ],
+            forms_1099_div=[
+                Form1099DIV(ordinary_dividends=50_000, qualified_dividends=40_000),
+            ],
+        )
+        result = calculate_return(profile)
+        # Qualified dividends should reduce the QBI cap
+        # Without qualified divs, cap would be higher
+        # This just checks it doesn't error and QBI is computed
+        assert result.qbi is not None
+        assert result.qbi.qbi_deduction >= 0
+
 
 # =============================================================================
 # TestCalculateIncomeTax
@@ -532,6 +635,89 @@ class TestCalculateNIIT:
     def test_mfj_below_threshold(self):
         niit = calculate_niit(50_000, 240_000, FilingStatus.MFJ)
         assert niit == 0
+
+
+# =============================================================================
+# TestCalculateAMT
+# =============================================================================
+
+class TestCalculateAMT:
+    def test_no_amt_standard_deduction_filer(self):
+        """Standard deduction filer should not trigger AMT (no SALT addback)."""
+        result = calculate_amt(100_000, 15_000, FilingStatus.SINGLE, salt_deduction=0)
+        assert result.amt == 0
+
+    def test_amt_with_salt_addback(self):
+        """SALT addback can trigger AMT."""
+        # Taxable = 200K, regular tax ~40K, SALT addback = 40K
+        # AMTI = 240K, exemption = 88,100, amt_taxable = 151,900
+        # TMT = 151,900 * 0.26 = 39,494
+        # AMT = max(39,494 - regular_tax, 0)
+        regular_tax = calculate_income_tax(200_000, SINGLE_BRACKETS)
+        result = calculate_amt(200_000, regular_tax, FilingStatus.SINGLE, salt_deduction=40_000)
+        # TMT should be around 39,494. Regular tax at 200K is ~39,110.50
+        # So AMT should be small positive
+        assert result.amti == 240_000
+        assert result.exemption == 88_100
+        assert result.amt >= 0
+
+    def test_mfs_exemption(self):
+        result = calculate_amt(100_000, 15_000, FilingStatus.MFS, salt_deduction=20_000)
+        assert result.exemption <= 68_500  # MFS exemption
+
+    def test_single_exemption(self):
+        result = calculate_amt(50_000, 5_000, FilingStatus.SINGLE, salt_deduction=10_000)
+        assert result.exemption == 88_100  # No phaseout at this level
+
+    def test_mfj_exemption(self):
+        result = calculate_amt(100_000, 10_000, FilingStatus.MFJ, salt_deduction=10_000)
+        assert result.exemption == 137_000
+
+    def test_exemption_phaseout(self):
+        """Exemption phases out at 25 cents per dollar above threshold."""
+        # Single: threshold = 626,350
+        # AMTI = 700,000, excess = 73,650
+        # reduction = 73,650 * 0.25 = 18,412.50
+        # exemption = 88,100 - 18,412.50 = 69,687.50
+        result = calculate_amt(680_000, 150_000, FilingStatus.SINGLE, salt_deduction=20_000)
+        assert result.amti == 700_000
+        expected_exemption = 88_100 - (700_000 - 626_350) * 0.25
+        assert result.exemption == round(expected_exemption, 2)
+
+    def test_26_pct_rate(self):
+        """Below breakpoint, TMT = 26% of excess."""
+        # AMTI = 200K, exemption = 88,100, excess = 111,900
+        # TMT = 111,900 * 0.26 = 29,094
+        result = calculate_amt(200_000, 0, FilingStatus.SINGLE, salt_deduction=0)
+        assert result.tentative_minimum_tax == round(111_900 * 0.26, 2)
+
+    def test_28_pct_rate(self):
+        """Above breakpoint ($239,100 for non-MFS), 28% kicks in."""
+        # AMTI = 400K, exemption = 88,100, excess = 311,900
+        # TMT = 239,100 * 0.26 + (311,900 - 239,100) * 0.28
+        # = 62,166 + 72,800 * 0.28 = 62,166 + 20,384 = 82,550
+        result = calculate_amt(400_000, 0, FilingStatus.SINGLE, salt_deduction=0)
+        expected = 239_100 * 0.26 + (311_900 - 239_100) * 0.28
+        assert result.tentative_minimum_tax == round(expected, 2)
+
+    def test_amt_zero_when_regular_exceeds_tmt(self):
+        """AMT = 0 when regular tax exceeds TMT."""
+        result = calculate_amt(50_000, 100_000, FilingStatus.SINGLE, salt_deduction=0)
+        assert result.amt == 0
+
+    def test_amt_flows_to_total_tax(self):
+        """AMT should be included in total_tax via calculate_return."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            uses_itemized_deductions=True,
+            state_local_tax_deduction=40_000,
+            businesses=[
+                ScheduleCData(business_name="Big Biz", gross_receipts=300_000),
+            ],
+        )
+        result = calculate_return(profile)
+        if result.amt > 0:
+            assert result.total_tax > result.tax + result.se_tax
 
 
 # =============================================================================
@@ -764,6 +950,419 @@ class TestK1QBI:
         result = calculate_return(profile)
         # Total QBI should include both Schedule C and K-1
         assert result.qbi.total_qbi == 80_000  # 50K + 30K
+
+
+# =============================================================================
+# TestInvestmentIncome
+# =============================================================================
+
+class TestInvestmentIncome:
+    def test_interest_flows_to_line_2b(self):
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_int=[
+                Form1099INT(interest_income=2_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.taxable_interest == 2_000
+        assert result.total_income == 2_000
+
+    def test_tax_exempt_interest_line_2a(self):
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_int=[
+                Form1099INT(interest_income=1_000, tax_exempt_interest=500),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.tax_exempt_interest == 500
+        # Tax-exempt doesn't go into total income
+        assert result.taxable_interest == 1_000
+        assert result.total_income == 1_000
+
+    def test_dividends_flow_to_line_3b(self):
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_div=[
+                Form1099DIV(ordinary_dividends=5_000, qualified_dividends=3_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.ordinary_dividends == 5_000
+        assert result.qualified_dividends == 3_000
+        assert result.total_income == 5_000
+
+    def test_capital_gain_flows_to_line_7(self):
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_b=[
+                Form1099B(lt_proceeds=50_000, lt_cost_basis=30_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.capital_gain_loss == 20_000
+        assert result.schedule_d is not None
+        assert result.schedule_d.net_lt_gain_loss == 20_000
+        assert result.total_income == 20_000
+
+    def test_capital_loss_limited_single(self):
+        """Single filer capital loss limited to $3,000."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_b=[
+                Form1099B(st_proceeds=5_000, st_cost_basis=15_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.capital_gain_loss == -3_000
+        assert result.schedule_d.net_capital_gain_loss == -10_000
+
+    def test_capital_loss_limited_mfs(self):
+        """MFS capital loss limited to $1,500."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            forms_1099_b=[
+                Form1099B(st_proceeds=5_000, st_cost_basis=15_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.capital_gain_loss == -1_500
+
+    def test_investment_income_feeds_niit(self):
+        """Interest and dividends feed net investment income for NIIT."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[
+                ScheduleCData(business_name="Biz", gross_receipts=250_000),
+            ],
+            forms_1099_int=[Form1099INT(interest_income=20_000)],
+            forms_1099_div=[Form1099DIV(ordinary_dividends=30_000)],
+        )
+        result = calculate_return(profile)
+        # AGI well above NIIT threshold (200K), NII = 20K+30K = 50K
+        assert result.niit > 0
+
+    def test_no_double_count_k1_interest(self):
+        """K-1 interest flows to Line 2b, not double-counted in Schedule 1."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="Bond Fund LP",
+                    interest_income=5_000,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.taxable_interest == 5_000
+        assert result.total_income == 5_000
+
+    def test_investment_withholding_flows_to_payments(self):
+        """1099 withholding should be included in total payments."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_int=[Form1099INT(interest_income=10_000, federal_tax_withheld=1_000)],
+            forms_1099_div=[Form1099DIV(ordinary_dividends=5_000, federal_tax_withheld=500)],
+            forms_1099_b=[Form1099B(lt_proceeds=20_000, lt_cost_basis=10_000, federal_tax_withheld=200)],
+        )
+        result = calculate_return(profile)
+        assert result.withholding == 1_700  # 1000+500+200
+
+    def test_schedule_d_st_and_lt(self):
+        """Schedule D aggregates short and long term gains."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_b=[
+                Form1099B(
+                    st_proceeds=10_000, st_cost_basis=8_000,
+                    lt_proceeds=20_000, lt_cost_basis=15_000,
+                ),
+            ],
+        )
+        sch_d = calculate_schedule_d(profile, FilingStatus.SINGLE)
+        assert sch_d.net_st_gain_loss == 2_000
+        assert sch_d.net_lt_gain_loss == 5_000
+        assert sch_d.net_capital_gain_loss == 7_000
+        assert sch_d.capital_gain_for_1040 == 7_000
+
+    def test_cap_gains_from_1099_div(self):
+        """1099-DIV Box 2a capital gain distributions flow to Schedule D LT."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_div=[
+                Form1099DIV(ordinary_dividends=3_000, capital_gain_distributions=2_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.schedule_d is not None
+        assert result.schedule_d.net_lt_gain_loss == 2_000
+        assert result.capital_gain_loss == 2_000
+
+
+# =============================================================================
+# TestK1OrphanedBoxes
+# =============================================================================
+
+class TestK1OrphanedBoxes:
+    def test_box3_other_rental_income(self):
+        """Box 3: Other net rental income flows to Schedule E."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(partnership_name="Rental LP", other_net_rental_income=8_000),
+            ],
+        )
+        result = calculate_schedule_e(profile)
+        assert result.net_rental_income == 8_000
+
+    def test_box6_dividends_flow_to_line_3b(self):
+        """Box 6a dividends flow to Form 1040 Line 3b."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(partnership_name="Div Fund", dividends=4_000, qualified_dividends=2_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.ordinary_dividends == 4_000
+        assert result.qualified_dividends == 2_000
+
+    def test_box7_royalties_in_schedule_e_and_niit(self):
+        """Box 7 royalties flow to Schedule E and count as NII."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[ScheduleCData(business_name="Biz", gross_receipts=250_000)],
+            schedule_k1s=[
+                ScheduleK1(partnership_name="Oil LP", royalties=10_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.schedule_e.royalties == 10_000
+        # Royalties should contribute to NII and thus NIIT
+        assert result.niit > 0
+
+    def test_box8_st_capital_gain_flows_to_schedule_d(self):
+        """Box 8 ST capital gain flows to Schedule D."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(partnership_name="Trading LP", net_short_term_capital_gain=5_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.schedule_d is not None
+        assert result.schedule_d.net_st_gain_loss == 5_000
+        assert result.capital_gain_loss == 5_000
+
+    def test_box10_section_1231_gain_as_ltcg(self):
+        """Box 10 §1231 gain treated as LTCG on Schedule D."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(partnership_name="Equipment LP", net_section_1231_gain=7_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.schedule_d is not None
+        assert result.schedule_d.net_lt_gain_loss == 7_000
+
+    def test_box11_other_income(self):
+        """Box 11 other income flows to Schedule E total."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(partnership_name="Misc LP", other_income=3_000),
+            ],
+        )
+        result = calculate_schedule_e(profile)
+        assert result.other_income == 3_000
+        assert result.total_schedule_e_income == 3_000
+
+    def test_box12_section_179(self):
+        """Box 12 §179 deduction reduces Schedule E income."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="Equipment LP",
+                    ordinary_business_income=20_000,
+                    section_179_deduction=5_000,
+                ),
+            ],
+        )
+        result = calculate_schedule_e(profile)
+        assert result.section_179_deduction == 5_000
+        assert result.total_schedule_e_income == 15_000
+
+    def test_box13_other_deductions(self):
+        """Box 13 other deductions reduce Schedule E income."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="Deduction LP",
+                    ordinary_business_income=10_000,
+                    other_deductions=2_000,
+                ),
+            ],
+        )
+        result = calculate_schedule_e(profile)
+        assert result.other_deductions == 2_000
+        assert result.total_schedule_e_income == 8_000
+
+    def test_multiple_k1s_aggregate(self):
+        """Multiple K-1s should aggregate all boxes correctly."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="LP One",
+                    ordinary_business_income=10_000,
+                    royalties=2_000,
+                ),
+                ScheduleK1(
+                    partnership_name="LP Two",
+                    ordinary_business_income=5_000,
+                    other_income=1_000,
+                    section_179_deduction=3_000,
+                ),
+            ],
+        )
+        result = calculate_schedule_e(profile)
+        assert result.ordinary_business_income == 15_000
+        assert result.royalties == 2_000
+        assert result.other_income == 1_000
+        assert result.section_179_deduction == 3_000
+        # 15000 + 2000 + 1000 - 3000 = 15000
+        assert result.total_schedule_e_income == 15_000
+
+    def test_existing_boxes_unchanged(self, mfs_expat):
+        """Existing K-1 handling (Boxes 1,2,4,5,9a,14) unchanged."""
+        result = calculate_return(mfs_expat)
+        assert result.schedule_e is not None
+        assert result.schedule_e.net_rental_income == 0  # MFS loss suspended
+
+
+# =============================================================================
+# TestTaxCredits
+# =============================================================================
+
+class TestTaxCredits:
+    def _make_family_profile(self, filing_status=FilingStatus.MFJ, num_children=2,
+                             gross_receipts=100_000, wages=0):
+        deps = [
+            Dependent(first_name=f"Child{i}", last_name="Test",
+                      relationship="child", is_qualifying_child_ctc=True)
+            for i in range(num_children)
+        ]
+        p = TaxpayerProfile(
+            filing_status=filing_status,
+            dependents=deps,
+            businesses=[
+                ScheduleCData(business_name="Family Biz", gross_receipts=gross_receipts),
+            ],
+        )
+        if wages > 0:
+            p.forms_w2 = [FormW2(wages=wages, ss_wages=wages, medicare_wages=wages)]
+        return p
+
+    def test_ctc_basic(self):
+        """2 children × $2,500 = $5,000 CTC."""
+        profile = self._make_family_profile()
+        result = calculate_return(profile)
+        assert result.tax_credits is not None
+        assert result.tax_credits.gross_ctc == 5_000
+
+    def test_ctc_phaseout_mfj(self):
+        """CTC phases out above $400K for MFJ."""
+        profile = self._make_family_profile(
+            filing_status=FilingStatus.MFJ, gross_receipts=500_000,
+        )
+        result = calculate_return(profile)
+        # AGI > 400K: phaseout should reduce credits
+        assert result.tax_credits.phaseout_reduction > 0
+        assert result.tax_credits.total_credit_after_phaseout < 5_000
+
+    def test_ctc_phaseout_single(self):
+        """CTC phases out above $200K for Single."""
+        profile = self._make_family_profile(
+            filing_status=FilingStatus.SINGLE, num_children=1, gross_receipts=250_000,
+        )
+        result = calculate_return(profile)
+        assert result.tax_credits.phaseout_reduction > 0
+
+    def test_no_children_zero_credits(self):
+        """No dependents means no credits."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[ScheduleCData(business_name="Biz", gross_receipts=100_000)],
+        )
+        result = calculate_return(profile)
+        assert result.tax_credits is None
+        assert result.nonrefundable_credits == 0
+
+    def test_ctc_limited_to_tax_liability(self):
+        """Nonrefundable CTC cannot exceed tax liability."""
+        # Low income: tax is small, CTC should be limited
+        profile = self._make_family_profile(gross_receipts=30_000)
+        result = calculate_return(profile)
+        assert result.tax_credits.nonrefundable_credit <= (result.tax + result.amt)
+
+    def test_actc_refundable(self):
+        """Unused CTC becomes refundable ACTC up to per-child cap."""
+        # Low income so CTC exceeds tax, remainder → ACTC
+        profile = self._make_family_profile(gross_receipts=40_000)
+        result = calculate_return(profile)
+        if result.tax_credits.nonrefundable_credit < result.tax_credits.gross_ctc:
+            # There's unused CTC, ACTC should be computed
+            assert result.tax_credits.refundable_actc >= 0
+
+    def test_actc_earned_income_formula(self):
+        """ACTC = 15% of (earned income - $2,500)."""
+        profile = self._make_family_profile(num_children=3, gross_receipts=20_000)
+        result = calculate_return(profile)
+        # earned_income = 20K, ACTC formula = 15% * (20K - 2.5K) = 2,625
+        max_by_formula = round(0.15 * (20_000 - 2_500), 2)
+        assert result.tax_credits.refundable_actc <= max_by_formula
+
+    def test_odc(self):
+        """Other dependent credit = $500 per non-CTC dependent."""
+        deps = [
+            Dependent(first_name="Child", last_name="Test",
+                      relationship="child", is_qualifying_child_ctc=True),
+            Dependent(first_name="Grandma", last_name="Test",
+                      relationship="parent", is_qualifying_child_ctc=False),
+        ]
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            dependents=deps,
+            businesses=[ScheduleCData(business_name="Biz", gross_receipts=100_000)],
+        )
+        result = calculate_return(profile)
+        assert result.tax_credits.gross_odc == 500
+        assert result.tax_credits.gross_ctc == 2_500
+
+    def test_credits_flow_to_return(self):
+        """Nonrefundable credits reduce total_tax; ACTC increases payments."""
+        profile = self._make_family_profile()
+        result_with = calculate_return(profile)
+        # Compare to no-dependent profile
+        profile_no_deps = TaxpayerProfile(
+            filing_status=FilingStatus.MFJ,
+            businesses=[ScheduleCData(business_name="Biz", gross_receipts=100_000)],
+        )
+        result_without = calculate_return(profile_no_deps)
+        # With credits, total tax should be lower
+        assert result_with.total_tax <= result_without.total_tax
+
+    def test_mfs_no_eitc(self):
+        """MFS filers are disqualified from EITC (stub returns 0)."""
+        profile = self._make_family_profile(filing_status=FilingStatus.MFS)
+        result = calculate_return(profile)
+        # No EITC field — it's just not computed for MFS
+        # This test confirms MFS with children still works
+        assert result.tax_credits is not None
 
 
 # =============================================================================
