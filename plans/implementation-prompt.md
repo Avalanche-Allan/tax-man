@@ -1,80 +1,146 @@
-# Implementation Prompt — CLI Completeness (Issues #2–#5)
+# Implementation Prompt — Codex Review Fixes (Batch 6)
 
 Paste everything below the line into a new Claude Code chat window.
 
 ---
 
-Implement 4 issues for the tax-man project. These are CLI plumbing fixes — the tax calculation engine (306 tests, all passing) is correct and should NOT be modified. Read the plan files before writing any code.
+Fix 6 bugs found by Codex review of the CLI layer. These are all CLI/wizard/plumbing fixes — the tax calculation engine (361 tests, all passing) is correct and should NOT be modified. The fixes are ordered P1 first, then P2, then P3.
 
-## Execution Order (strict — #3 depends on #2)
+## Execution Order
 
-1. **Issue #2** — Session resume / profile hydration
-2. **Issue #3** — Wire export/review/compare commands
-3. **Issue #4** — Document parsing integration
-4. **Issue #5** — PDF field mapping validation tests
+1. **Fix 1 (P1)** — Parsed document prefill lost on resume
+2. **Fix 2 (P1)** — K-1 parsed detail overwritten in income step
+3. **Fix 3 (P2)** — Quarterly plan uses placeholder prior_year_tax
+4. **Fix 4 (P2)** — Foreign-income "not abroad" branch skips profile save
+5. **Fix 5 (P2)** — SSN split field mapping is guessed
+6. **Fix 6 (P3)** — generated_forms list set but not saved
 
-## Plans
+## Current State
 
-All plans are in `plans/` with full phase breakdowns, code snippets, files to touch, tests needed, and definitions of done. Read them first:
-
-- `plans/issue-2-session-resume.md`
-- `plans/issue-3-export-command.md`
-- `plans/issue-4-document-parsing-integration.md`
-- `plans/issue-5-pdf-field-validation.md`
+All 4 previous CLI issues (#2–#5) are complete and committed. The codebase has:
+- Full profile serialization/deserialization (`taxman/cli/serialization.py`)
+- Wired export/review/compare commands (`taxman/cli/app.py`)
+- Document parsing integration in wizard (`taxman/cli/wizard.py`)
+- PDF field mapping validation tests (`tests/test_field_mappings.py`)
 
 ## Key Files You'll Need to Read
 
-Before starting, read these files to understand the current state:
-
 | File | What it contains |
 |------|-----------------|
-| `taxman/models.py` | All dataclasses: TaxpayerProfile, ScheduleCData, ScheduleK1, FormW2, Form1099NEC/INT/DIV/B, HealthInsurance, HomeOffice, Dependent, FilingStatus enum, etc. |
-| `taxman/cli/state.py` | SessionState dataclass — save/load/list sessions to ~/.taxman/sessions/*.json |
-| `taxman/cli/wizard.py` | TaxWizard with 13 _step_* methods, WIZARD_STEPS list, resume logic |
-| `taxman/cli/app.py` | Typer CLI commands: prepare, review, export, compare, scan, sessions |
-| `taxman/cli/display.py` | Rich display functions: display_tax_breakdown, display_result_panel, display_income_table |
-| `taxman/calculator.py` | Form1040Result dataclass, calculate_return(), compare_feie_scenarios(), estimate_quarterly_payments() |
-| `taxman/parse_documents.py` | ParseResult dataclass, parse_1099_nec(), parse_w2(), parse_k1_1065(), parse_1098_mortgage(), parse_1095_a(), parse_charity_receipt(), parse_prior_return(), scan_documents_folder() |
-| `taxman/fill_forms.py` | generate_all_forms(), fill_form(), inspect_form_fields() |
-| `taxman/field_mappings/` | build_*_data() functions for each form (f1040.py, f1040sc.py, f1040sse.py, f1040se.py, f8995.py, f2555.py, common.py) |
-| `taxman/reports.py` | generate_tax_summary(), generate_line_detail_report(), generate_filing_checklist(), generate_quarterly_plan(), generate_feie_comparison_report() |
+| `taxman/cli/wizard.py` | TaxWizard class — `__init__` (line 97), `_apply_parsed_results` (line 336), `_step_income_review` (line 410), `_step_foreign_income` (line 599), `_step_generate_forms` (line 693) |
+| `taxman/cli/app.py` | Typer CLI commands — `export()` calls `generate_quarterly_plan(..., prior_year_tax=0.0, ...)` at line 162 |
+| `taxman/cli/state.py` | SessionState — `parsed_documents` list, `generated_forms` list, `save()` |
+| `taxman/cli/serialization.py` | `serialize_profile()`, `deserialize_profile()`, `serialize_result()`, `deserialize_result()` |
+| `taxman/field_mappings/f1040.py` | SSN split mapping with guess comment at line 42 |
+| `taxman/models.py` | TaxpayerProfile, ScheduleK1 (all K-1 box fields), FormW2, Form1099NEC, etc. |
+| `taxman/parse_documents.py` | ParseResult dataclass, parse_k1_1065() — returns ScheduleK1 with all boxes |
 
 ## Current Test Baseline
 
-306 tests, all passing:
+361 tests, all passing:
 ```
 python3 -m pytest tests/ --tb=short
 ```
 
 Test files:
-- `tests/test_calculator.py` — 140 tests (engine logic)
-- `tests/test_colorado.py` — 20 tests (CO state tax)
-- `tests/test_integration.py` — 62 tests (end-to-end scenarios)
-- `tests/test_models.py` — 84 tests (model validation)
+- `tests/test_calculator.py` — calculator engine tests
+- `tests/test_cli_commands.py` — export/review/compare tests
+- `tests/test_colorado.py` — CO state tax tests
+- `tests/test_field_mappings.py` — PDF field mapping validation
+- `tests/test_integration.py` — end-to-end scenarios
+- `tests/test_models.py` — model validation
+- `tests/test_serialization.py` — session serialization round-trips
+- `tests/test_wizard_parsing.py` — document parsing integration
 
 ## Constraints
 
-1. **Do NOT modify the tax calculation engine** (`calculator.py` logic, `constants.py` values). It is correct and tested. You are only wiring up the CLI layer.
-2. **Do NOT modify existing tests** unless a test is directly testing something you're changing (e.g., if you remove `income_data` from SessionState, update any test that references it).
-3. **Run `python3 -m pytest tests/ --tb=short` after each issue** to ensure no regressions. All existing 306 tests must continue to pass.
-4. **Commit after each issue** with a descriptive message. Do not batch all 4 into one commit.
-5. **Follow existing code patterns**: the project uses dataclasses (not Pydantic), Rich for display, Typer for CLI, questionary for prompts, PyPDFForm for PDF filling.
-6. For Issue #5 (field inventory tests), the tests need the actual IRS PDF files downloaded. Use `download_irs_form(form_key)` from `fill_forms.py` to ensure they're cached in `forms/` before running `inspect_form_fields()`. Mark these tests with `@pytest.mark.slow` or skip if PDFs aren't available.
+1. **Do NOT modify the tax calculation engine** (`calculator.py` logic, `constants.py` values).
+2. **Do NOT modify existing tests** unless directly testing something you're changing.
+3. **Run `python3 -m pytest tests/ --tb=short` after each fix** — all 361 existing tests must continue to pass.
+4. **Commit after each fix** (or batch closely related fixes) with a descriptive message.
+5. **Follow existing patterns**: dataclasses (not Pydantic), Rich, Typer, questionary, PyPDFForm.
+6. **Write tests for each fix** — add them to the appropriate existing test file or create a new one if needed.
 
-## Issue #2 Summary — Session Resume
+---
 
-Create `taxman/cli/serialization.py` with serialize/deserialize functions for TaxpayerProfile and Form1040Result. Add `schema_version` and `profile_data` fields to SessionState. Save profile after each wizard step that mutates it. Rehydrate on resume. Persist calculation results after Step 10.
+## Fix 1 (P1): Parsed document prefill lost on resume
 
-Key test: **resume parity** — prove that an interrupted+resumed wizard produces the same Form1040Result as an uninterrupted run.
+**Problem:** `TaxWizard.__init__` (line 104) initializes `self.parsed_results = []` unconditionally. On resume, `session.parsed_documents` contains saved parse results, but they are never rehydrated into `self.parsed_results`. So `_apply_parsed_results()` (line 342) has nothing to apply.
 
-## Issue #3 Summary — Export/Review/Compare
+**Impact:** User scans/parses documents, quits, resumes at Step 5/6 — all document-derived prefill silently disappears.
 
-Wire `export` to call `generate_all_forms()` + report generators, writing files to output_dir. Wire `review` to call display functions with deserialized result. Wire `compare` to call `compare_feie_scenarios()`. All three should fail loudly with helpful messages when session data is missing.
+**Fix:** In `__init__`, after rehydrating profile and result, rebuild `self.parsed_results` from `self.session.parsed_documents`. Each entry is a dict with keys `type`, `confidence`, `needs_manual_review`, `warnings`, `data`, `source_file`. Reconstruct `ParseResult` objects with the appropriate model instances (FormW2, Form1099NEC, ScheduleK1, Form1098) based on the `type` field.
 
-## Issue #4 Summary — Document Parsing Integration
+**Files to modify:** `taxman/cli/wizard.py`
 
-In `_step_document_review()`, dispatch confirmed documents to the matching `parse_*()` function. Store results. In `_step_income_review()`, call `_apply_parsed_results()` to populate the profile from parsed data, then let user confirm/edit/remove. Persist parsed documents to session.
+**Test:** Add a test to `tests/test_wizard_parsing.py` that saves parsed results to a session, creates a new TaxWizard with that session, and verifies `self.parsed_results` is populated and `_apply_parsed_results()` works.
 
-## Issue #5 Summary — PDF Field Mapping Validation
+---
 
-Write `tests/test_field_mappings.py` with: (a) field inventory tests that assert our field names exist in the actual PDFs, (b) line-consistency math tests that verify build_*_data() output is internally consistent (e.g., Schedule C: Line 31 = Line 7 - Line 28 - Line 30), (c) golden-file snapshot tests that fill a PDF and verify known values appear in extracted text.
+## Fix 2 (P1): K-1 parsed detail overwritten in income step
+
+**Problem:** `_step_income_review` (line 465) resets `self.profile.schedule_k1s = []` and only re-collects `partnership_name` + `net_rental_income` (line 475). This drops all other parsed K-1 fields: `ordinary_business_income` (Box 1), `guaranteed_payments` (Box 4), `interest_income` (Box 5), `capital_gains` (Boxes 8/9a), `section_1231_gain` (Box 10), `other_income` (Box 11), and distribution/tax fields (Boxes 13/14).
+
+**Impact:** Parser integration correctly populates rich K-1 data, but Step 6 wipes it all to just two fields.
+
+**Fix:** When the user already has K-1s populated (from parsing), present the existing data for confirmation/editing instead of wiping and re-collecting from scratch. If user chooses to edit a K-1, let them modify specific fields. If adding new K-1s manually (no parsed data), the current simple collection is fine as a starting point — but don't overwrite parsed K-1s.
+
+**Files to modify:** `taxman/cli/wizard.py`
+
+**Test:** Add a test to `tests/test_wizard_parsing.py` that populates K-1s via `_apply_parsed_results()`, then verifies the K-1 data survives (or is properly merged) rather than being wiped.
+
+---
+
+## Fix 3 (P2): Exported quarterly plan uses placeholder prior_year_tax
+
+**Problem:** `export()` in `app.py` (line 162) calls `generate_quarterly_plan(result.total_tax, 0.0, result.agi, ...)` — hardcoded `prior_year_tax=0.0`. This makes the safe-harbor calculation (110% of prior year) meaningless.
+
+**Impact:** The quarterly_plan.txt output is not decision-grade for tax planning.
+
+**Fix:** Add `prior_year_tax` as an optional field on TaxpayerProfile (or SessionState). Collect it in the wizard (Step 8 deductions area or a new substep). Pass the real value to `generate_quarterly_plan()`. If not available, default to 0.0 but include a warning in the output.
+
+**Files to modify:** `taxman/models.py` (add field), `taxman/cli/wizard.py` (collect it), `taxman/cli/app.py` (pass it), `taxman/cli/serialization.py` (serialize it)
+
+**Test:** Add a test to `tests/test_cli_commands.py` that verifies the quarterly plan uses a real prior_year_tax value when available.
+
+---
+
+## Fix 4 (P2): Foreign-income "not abroad" branch skips profile save
+
+**Problem:** `_step_foreign_income` (line 607) returns early when user says "not abroad" without calling `self._save_profile()`. The profile mutation (`days_in_foreign_country_2025 = 0`) is not persisted.
+
+**Impact:** On resume, the foreign income state can be stale/inconsistent.
+
+**Fix:** Add `self._save_profile()` before the early return at line 609.
+
+**Files to modify:** `taxman/cli/wizard.py`
+
+**Test:** Add a test that verifies the profile is saved when user says "not abroad" (mock save and verify it's called, or check session state).
+
+---
+
+## Fix 5 (P2): SSN split field mapping is guessed
+
+**Problem:** In `f1040.py` line 42, the SSN split across `f1_03`/`f1_05` includes a `# This is a guess` comment. The actual IRS field layout for the 2025 1040 may differ.
+
+**Impact:** SSN digits could be placed in wrong fields on the generated PDF.
+
+**Fix:** Use `inspect_form_fields()` from `fill_forms.py` to examine the actual 2025 f1040 PDF field schema and determine the correct SSN field mapping. Update the mapping to match reality, or if the fields truly can't be determined from the schema, map only the full SSN to `f1_16[0]` and remove the guessed split. Remove the guess comment either way.
+
+**Files to modify:** `taxman/field_mappings/f1040.py`
+
+**Test:** Add a test to `tests/test_field_mappings.py` that verifies no field mapping file contains the word "guess" (defensive lint test).
+
+---
+
+## Fix 6 (P3): generated_forms list set but not saved
+
+**Problem:** `_step_generate_forms` (line 730) sets `self.session.generated_forms = [str(output_path)]` but never calls `self.session.save()`.
+
+**Impact:** Minor state-tracking inconsistency — generated_forms won't survive restart.
+
+**Fix:** Add `self.session.save()` after setting `generated_forms`.
+
+**Files to modify:** `taxman/cli/wizard.py`
+
+**Test:** Add a test that verifies session is saved after form generation step.
