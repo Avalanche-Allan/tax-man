@@ -14,9 +14,11 @@ from taxman.calculator import (
     calculate_schedule_e,
     calculate_schedule_se,
     calculate_tax_credits,
+    calculate_tax_with_qdcg_worksheet,
     compare_feie_scenarios,
     estimate_quarterly_payments,
     evaluate_feie,
+    Form2555Result,
     generate_optimization_recommendations,
 )
 from taxman.constants import (
@@ -41,6 +43,7 @@ from taxman.models import (
     Form1099B,
     Form1099DIV,
     Form1099INT,
+    Form1099NEC,
     FormW2,
     HomeOffice,
     ScheduleCData,
@@ -1449,3 +1452,218 @@ class TestOptimizationRecommendations:
         recs = generate_optimization_recommendations(result, single_freelancer)
         feie_rec = [r for r in recs if "FEIE" in r["title"] or "Foreign" in r["title"]]
         assert len(feie_rec) == 0
+
+
+# =============================================================================
+# TestQDCGWorksheet — Fix #2
+# =============================================================================
+
+class TestQDCGWorksheet:
+    """Tests for the Qualified Dividends and Capital Gain Tax Worksheet."""
+
+    def test_zero_pct_rate_single(self):
+        """LTCG fully in the 0% bracket for a single filer."""
+        # $40,000 taxable income, all from LTCG → all in 0% bracket ($48,350 threshold)
+        tax = calculate_tax_with_qdcg_worksheet(
+            taxable_income=40_000, qualified_dividends=0,
+            net_lt_gain=40_000, net_st_gain=0,
+            filing_status=FilingStatus.SINGLE,
+        )
+        assert tax == 0.0
+
+    def test_fifteen_pct_rate_single(self):
+        """LTCG taxed at 15% for a single filer above 0% threshold."""
+        # $100,000 ordinary + $50,000 LTCG = $150,000 taxable
+        # All LTCG is above the $48,350 threshold, taxed at 15%
+        tax = calculate_tax_with_qdcg_worksheet(
+            taxable_income=150_000, qualified_dividends=0,
+            net_lt_gain=50_000, net_st_gain=0,
+            filing_status=FilingStatus.SINGLE,
+        )
+        ordinary_tax = calculate_income_tax(100_000, BRACKETS_BY_STATUS[FilingStatus.SINGLE])
+        # All $50K LTCG is above the 0% zone (ordinary already fills it)
+        expected = ordinary_tax + 50_000 * 0.15
+        assert tax == round(expected, 2)
+
+    def test_twenty_pct_rate_single(self):
+        """LTCG taxed at 20% for very high income single filer."""
+        # $540,000 ordinary + $50,000 LTCG = $590,000 taxable
+        # 15% threshold for single is $533,400
+        tax = calculate_tax_with_qdcg_worksheet(
+            taxable_income=590_000, qualified_dividends=0,
+            net_lt_gain=50_000, net_st_gain=0,
+            filing_status=FilingStatus.SINGLE,
+        )
+        ordinary_tax = calculate_income_tax(540_000, BRACKETS_BY_STATUS[FilingStatus.SINGLE])
+        # ordinary $540K > $533,400 threshold, so all LTCG at 20%
+        expected = ordinary_tax + 50_000 * 0.20
+        assert tax == round(expected, 2)
+
+    def test_qualified_dividends_at_zero_pct(self):
+        """Qualified dividends taxed at 0% when under threshold."""
+        # $30,000 all qualified dividends, single filer
+        tax = calculate_tax_with_qdcg_worksheet(
+            taxable_income=30_000, qualified_dividends=30_000,
+            net_lt_gain=0, net_st_gain=0,
+            filing_status=FilingStatus.SINGLE,
+        )
+        assert tax == 0.0
+
+    def test_mixed_ordinary_and_preferential(self):
+        """Mixed ordinary income + qualified dividends + LTCG."""
+        # MFS: $60,000 ordinary + $10,000 qual divs + $20,000 LTCG = $90,000
+        # 0% threshold MFS: $48,350; 15% threshold: $300,000
+        tax = calculate_tax_with_qdcg_worksheet(
+            taxable_income=90_000, qualified_dividends=10_000,
+            net_lt_gain=20_000, net_st_gain=0,
+            filing_status=FilingStatus.MFS,
+        )
+        ordinary_tax = calculate_income_tax(60_000, BRACKETS_BY_STATUS[FilingStatus.MFS])
+        # preferential = 30K, ordinary = 60K
+        # 0% room: max(48350 - 60000, 0) = 0 → all 30K at 15%
+        expected = ordinary_tax + 30_000 * 0.15
+        assert tax == round(expected, 2)
+
+    def test_stcl_offsets_ltcg(self):
+        """Short-term capital loss reduces net capital gain."""
+        # $80,000 ordinary + $20,000 LTCG - $10,000 STCL = $90,000 taxable
+        # net_cap_gain = max(20000 + (-10000), 0) = 10000
+        tax = calculate_tax_with_qdcg_worksheet(
+            taxable_income=90_000, qualified_dividends=0,
+            net_lt_gain=20_000, net_st_gain=-10_000,
+            filing_status=FilingStatus.SINGLE,
+        )
+        ordinary_tax = calculate_income_tax(80_000, BRACKETS_BY_STATUS[FilingStatus.SINGLE])
+        # preferential = 10K, ordinary = 80K
+        # 0% room: max(48350 - 80000, 0) = 0 → all 10K at 15%
+        expected = ordinary_tax + 10_000 * 0.15
+        assert tax == round(expected, 2)
+
+    def test_min_check_returns_regular_if_lower(self):
+        """QDCG worksheet never produces more tax than regular brackets."""
+        # Edge case: all income is ordinary (no preferential income)
+        regular_tax = calculate_income_tax(50_000, BRACKETS_BY_STATUS[FilingStatus.SINGLE])
+        worksheet_tax = calculate_tax_with_qdcg_worksheet(
+            taxable_income=50_000, qualified_dividends=0,
+            net_lt_gain=0, net_st_gain=0,
+            filing_status=FilingStatus.SINGLE,
+        )
+        assert worksheet_tax == regular_tax
+
+    def test_integration_with_calculate_return(self):
+        """calculate_return() uses QDCG worksheet when qualified dividends exist."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_div=[Form1099DIV(
+                payer_name="Vanguard",
+                ordinary_dividends=10_000,
+                qualified_dividends=8_000,
+            )],
+        )
+        result = calculate_return(profile)
+        # Tax should be less than if all dividends were ordinary
+        regular_tax = calculate_income_tax(result.taxable_income, BRACKETS_BY_STATUS[FilingStatus.SINGLE])
+        assert result.tax <= regular_tax
+
+
+# =============================================================================
+# TestNECWithholdingAndRouting — Fix #5
+# =============================================================================
+
+class TestNECWithholdingAndRouting:
+    """Tests for 1099-NEC withholding and auto Schedule C creation."""
+
+    def test_nec_withholding_included(self):
+        """1099-NEC federal withholding should be included in total payments."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[ScheduleCData(
+                business_name="Consulting",
+                gross_receipts=50_000,
+            )],
+            forms_1099_nec=[Form1099NEC(
+                payer_name="Client A",
+                nonemployee_compensation=50_000,
+                federal_tax_withheld=5_000,
+            )],
+        )
+        result = calculate_return(profile)
+        assert result.withholding == 5_000
+
+    def test_auto_create_schedule_c_from_nec(self):
+        """When no businesses defined, 1099-NEC creates auto Schedule C."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_nec=[
+                Form1099NEC(payer_name="Client A", nonemployee_compensation=30_000),
+                Form1099NEC(payer_name="Client B", nonemployee_compensation=20_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert len(result.schedule_c_results) == 1
+        assert result.schedule_c_results[0].gross_receipts == 50_000
+        assert result.schedule_c_results[0].business_name == "1099-NEC Income"
+
+    def test_no_auto_create_when_businesses_exist(self):
+        """When businesses are defined, 1099-NEC does NOT auto-create Schedule C."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[ScheduleCData(
+                business_name="My Biz",
+                gross_receipts=80_000,
+            )],
+            forms_1099_nec=[Form1099NEC(
+                payer_name="Client",
+                nonemployee_compensation=80_000,
+            )],
+        )
+        result = calculate_return(profile)
+        assert len(result.schedule_c_results) == 1
+        assert result.schedule_c_results[0].business_name == "My Biz"
+
+    def test_profile_not_mutated(self):
+        """Auto Schedule C creation should not mutate profile.businesses."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_nec=[Form1099NEC(
+                payer_name="Client",
+                nonemployee_compensation=25_000,
+            )],
+        )
+        assert len(profile.businesses) == 0
+        calculate_return(profile)
+        assert len(profile.businesses) == 0  # profile unchanged
+
+
+# =============================================================================
+# TestFEIEIntegration — Fix #1
+# =============================================================================
+
+class TestFEIEIntegration:
+    """Tests for FEIE result returned from compare_feie_scenarios()."""
+
+    def test_feie_result_key_returned(self):
+        """compare_feie_scenarios() should include 'feie_result' key."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=340,
+            businesses=[ScheduleCData(
+                business_name="Remote Consulting",
+                gross_receipts=120_000,
+            )],
+        )
+        scenarios = compare_feie_scenarios(profile)
+        assert "feie_result" in scenarios
+
+    def test_feie_result_is_form2555_result(self):
+        """feie_result should be a Form2555Result instance."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=340,
+            businesses=[ScheduleCData(
+                business_name="Remote Consulting",
+                gross_receipts=120_000,
+            )],
+        )
+        scenarios = compare_feie_scenarios(profile)
+        assert isinstance(scenarios["feie_result"], Form2555Result)

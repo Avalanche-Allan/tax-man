@@ -197,6 +197,18 @@ AMT_RATE_HIGH = 0.28
 AMT_BREAKPOINT_MFS = 119_550
 AMT_BREAKPOINT_OTHER = 239_100
 
+# Long-term capital gains rate thresholds (Rev. Proc. 2024-40)
+# 0% rate applies to taxable income up to these thresholds
+LTCG_ZERO_PCT_SINGLE = 48_350
+LTCG_ZERO_PCT_MFJ = 96_700
+LTCG_ZERO_PCT_MFS = 48_350
+LTCG_ZERO_PCT_HOH = 64_750
+# 15% rate applies from the 0% threshold up to these thresholds
+LTCG_FIFTEEN_PCT_SINGLE = 533_400
+LTCG_FIFTEEN_PCT_MFJ = 600_050
+LTCG_FIFTEEN_PCT_MFS = 300_000
+LTCG_FIFTEEN_PCT_HOH = 566_700
+
 # Capital loss deduction limit
 CAPITAL_LOSS_LIMIT_MFS = 1_500  # Half of normal $3,000
 CAPITAL_LOSS_LIMIT_OTHER = 3_000  # Single, MFJ, HOH, QSS

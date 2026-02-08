@@ -42,6 +42,14 @@ from taxman.constants import (
     ESTIMATED_TAX_PRIOR_YEAR_PCT,
     ESTIMATED_TAX_SAFE_HARBOR_PCT,
     FEIE_EXCLUSION_LIMIT,
+    LTCG_FIFTEEN_PCT_HOH,
+    LTCG_FIFTEEN_PCT_MFJ,
+    LTCG_FIFTEEN_PCT_MFS,
+    LTCG_FIFTEEN_PCT_SINGLE,
+    LTCG_ZERO_PCT_HOH,
+    LTCG_ZERO_PCT_MFJ,
+    LTCG_ZERO_PCT_MFS,
+    LTCG_ZERO_PCT_SINGLE,
     MEALS_DEDUCTION_PCT,
     MFS_BRACKETS,
     MFJ_BRACKETS,
@@ -145,6 +153,22 @@ CAPITAL_LOSS_LIMITS = {
     FilingStatus.MFJ: CAPITAL_LOSS_LIMIT_OTHER,
     FilingStatus.HOH: CAPITAL_LOSS_LIMIT_OTHER,
     FilingStatus.QSS: CAPITAL_LOSS_LIMIT_OTHER,
+}
+
+LTCG_ZERO_THRESHOLDS = {
+    FilingStatus.SINGLE: LTCG_ZERO_PCT_SINGLE,
+    FilingStatus.MFS: LTCG_ZERO_PCT_MFS,
+    FilingStatus.MFJ: LTCG_ZERO_PCT_MFJ,
+    FilingStatus.HOH: LTCG_ZERO_PCT_HOH,
+    FilingStatus.QSS: LTCG_ZERO_PCT_MFJ,
+}
+
+LTCG_FIFTEEN_THRESHOLDS = {
+    FilingStatus.SINGLE: LTCG_FIFTEEN_PCT_SINGLE,
+    FilingStatus.MFS: LTCG_FIFTEEN_PCT_MFS,
+    FilingStatus.MFJ: LTCG_FIFTEEN_PCT_MFJ,
+    FilingStatus.HOH: LTCG_FIFTEEN_PCT_HOH,
+    FilingStatus.QSS: LTCG_FIFTEEN_PCT_MFJ,
 }
 
 # =============================================================================
@@ -819,6 +843,70 @@ def calculate_income_tax(taxable_income: float,
     return round(tax, 2)
 
 
+def calculate_tax_with_qdcg_worksheet(
+    taxable_income: float,
+    qualified_dividends: float,
+    net_lt_gain: float,
+    net_st_gain: float,
+    filing_status: FilingStatus,
+) -> float:
+    """Qualified Dividends and Capital Gain Tax Worksheet.
+
+    Computes tax using preferential 0%/15%/20% rates for qualified dividends
+    and net long-term capital gains, then returns the lesser of worksheet tax
+    or regular tax (IRS safety check).
+
+    Based on IRS Form 1040 Instructions, "Qualified Dividends and Capital
+    Gain Tax Worksheet" (line 16).
+    """
+    brackets = BRACKETS_BY_STATUS.get(filing_status, MFS_BRACKETS)
+    regular_tax = calculate_income_tax(taxable_income, brackets)
+
+    if taxable_income <= 0:
+        return 0.0
+
+    # Net capital gain = net LTCG reduced by any net STCL (but not below 0)
+    net_st_loss = min(net_st_gain, 0)  # negative or zero
+    net_cap_gain = max(net_lt_gain + net_st_loss, 0)
+
+    # Preferential income: qualified dividends + net capital gain,
+    # but cannot exceed taxable income
+    preferential_income = min(qualified_dividends + net_cap_gain, taxable_income)
+
+    if preferential_income <= 0:
+        return regular_tax
+
+    # Ordinary income portion (taxed at regular brackets)
+    ordinary_portion = max(taxable_income - preferential_income, 0)
+    ordinary_tax = calculate_income_tax(ordinary_portion, brackets)
+
+    # Stack preferential income on top of ordinary income
+    # and apply 0%/15%/20% rates based on total taxable income thresholds
+    zero_threshold = LTCG_ZERO_THRESHOLDS.get(filing_status, LTCG_ZERO_PCT_MFS)
+    fifteen_threshold = LTCG_FIFTEEN_THRESHOLDS.get(filing_status, LTCG_FIFTEEN_PCT_MFS)
+
+    # How much room in the 0% bracket (above ordinary income)?
+    zero_room = max(zero_threshold - ordinary_portion, 0)
+    at_zero_pct = min(preferential_income, zero_room)
+    remaining = preferential_income - at_zero_pct
+
+    # How much room in the 15% bracket?
+    fifteen_room = max(fifteen_threshold - ordinary_portion - at_zero_pct, 0)
+    at_fifteen_pct = min(remaining, fifteen_room)
+    at_twenty_pct = remaining - at_fifteen_pct
+
+    preferential_tax = round(
+        at_zero_pct * 0.0
+        + at_fifteen_pct * 0.15
+        + at_twenty_pct * 0.20, 2
+    )
+
+    worksheet_tax = round(ordinary_tax + preferential_tax, 2)
+
+    # IRS safety check: use the lesser of worksheet tax or regular tax
+    return min(worksheet_tax, regular_tax)
+
+
 def calculate_additional_medicare(
     se_earnings: float,
     filing_status: FilingStatus = FilingStatus.MFS,
@@ -1078,8 +1166,18 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
     fs = profile.filing_status
 
     # ─── SCHEDULE C (for each business) ─────────────────────────
+    # Auto-create Schedule C from 1099-NEC if no businesses defined
+    businesses = list(profile.businesses)
+    if not businesses and profile.forms_1099_nec:
+        nec_total = sum(f.nonemployee_compensation for f in profile.forms_1099_nec)
+        if nec_total > 0:
+            businesses.append(ScheduleCData(
+                business_name="1099-NEC Income",
+                gross_receipts=nec_total,
+            ))
+
     total_business_income = 0.0
-    for biz in profile.businesses:
+    for biz in businesses:
         sc = calculate_schedule_c(biz)
         result.schedule_c_results.append(sc)
         total_business_income += sc.net_profit_loss
@@ -1291,10 +1389,24 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
 
     # ─── TAX ───────────────────────────────────────────────────
     brackets = BRACKETS_BY_STATUS.get(fs, MFS_BRACKETS)
-    result.tax = calculate_income_tax(result.taxable_income, brackets)
+    # Use QDCG worksheet when there are qualified dividends or net LTCG
+    net_lt_for_qdcg = sch_d.net_lt_gain_loss if sch_d else 0.0
+    net_st_for_qdcg = sch_d.net_st_gain_loss if sch_d else 0.0
+    if qualified_dividends > 0 or net_lt_for_qdcg > 0:
+        result.tax = calculate_tax_with_qdcg_worksheet(
+            result.taxable_income,
+            qualified_dividends,
+            net_lt_for_qdcg,
+            net_st_for_qdcg,
+            fs,
+        )
+        tax_method = "QDCG worksheet"
+    else:
+        result.tax = calculate_income_tax(result.taxable_income, brackets)
+        tax_method = f"{fs.value.upper()} tax brackets"
     lines.append(LineItem("Form 1040", "16", "Tax",
                           result.tax,
-                          f"From {fs.value.upper()} tax brackets"))
+                          f"From {tax_method}"))
 
     # Additional Medicare Tax (Form 8959)
     # Per Form 8959: applies to combined W-2 Medicare wages + SE earnings
@@ -1381,6 +1493,7 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
         sum(f.federal_tax_withheld for f in profile.forms_1099_int)
         + sum(f.federal_tax_withheld for f in profile.forms_1099_div)
         + sum(f.federal_tax_withheld for f in profile.forms_1099_b)
+        + sum(f.federal_tax_withheld for f in profile.forms_1099_nec)
     )
     result.withholding = round(w2_withholding + form_1099_withholding, 2)
     if result.withholding > 0:
@@ -1454,6 +1567,7 @@ def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
             "se_tax_unchanged": result_no_feie.se_tax,
             "is_beneficial": feie_eval.is_beneficial,
         },
+        "feie_result": feie_eval,
         "recommendation": (
             f"Take the FEIE — saves ${feie_eval.savings:,.2f} in income tax"
             if feie_eval.is_beneficial

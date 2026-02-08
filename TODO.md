@@ -26,8 +26,8 @@
 - [x] `inspect_form_fields` uses clean single iteration (was redundant logic)
 
 ### Testing (Phase 2)
-- [x] 287 tests across 4 test files + fixtures
-- [x] Calculator tests (122): brackets, SE tax, QBI, FEIE, NIIT, AMT, credits, investment income, Schedule D, K-1 all boxes
+- [x] 301 tests across 4 test files + fixtures
+- [x] Calculator tests (136): brackets, SE tax, QBI, FEIE, NIIT, AMT, credits, QDCG worksheet, 1099-NEC routing, investment income, Schedule D, K-1 all boxes
 - [x] Model tests (84): validation, properties, edge cases, parsing, form filling
 - [x] Integration tests (61): full MFS/single/MFJ returns, consistency checks
 - [x] Colorado tests (20): source income, Form 104, apportionment, SALT addback, pension/TABOR
@@ -65,14 +65,21 @@
 - [x] AMT (Form 6251): exemption with phaseout, 26%/28% rates, integrated into total_tax
 - [x] Credits (Schedule 8812): CTC $2,500/child (OBBBA), ODC $500, ACTC refundable — with phaseout
 
+### Codex Review Fixes (Phase 8)
+- [x] QDCG Worksheet: `calculate_tax_with_qdcg_worksheet()` — qualified dividends + net LTCG taxed at preferential 0%/15%/20% rates using stacking method. LTCG thresholds (Rev. Proc. 2024-40) in constants.py. Integrated into `calculate_return()` when qual divs or net LTCG > 0.
+- [x] 1099-NEC routing: auto-creates Schedule C from 1099-NEC total when `profile.businesses` is empty (uses local list — profile not mutated). NEC federal withholding added to payments sum.
+- [x] FEIE integration: `compare_feie_scenarios()` returns `feie_result` (Form2555Result). Wizard Step 11 persists `self.result.feie` when beneficial, enabling Form 2555 PDF generation.
+- [x] PDF field mappings: updated all 6 field_mappings files with real field names from 2025 IRS fillable PDFs discovered via `inspect_form_fields()`. Uses `f1_01[0]` format for PyPDFForm.
+
 ---
 
 ## Remaining
 
 ### Before Filing
 
-- [ ] **Discover real PDF field names** — run `inspect_form_fields_raw()` against 2025 IRS PDFs and update `taxman/field_mappings/` with actual field names (currently placeholders)
-- [ ] **Download 2025 IRS fillable PDFs** — place in `forms/` (f1040, f1040sc, f1040sse, f1040se, f8995, f2555, etc.)
+- [x] **Discover real PDF field names** — ran `inspect_form_fields()` against 2025 IRS PDFs, updated all 6 field_mappings files
+- [x] **Download 2025 IRS fillable PDFs** — placed in `forms/` (f1040, f1040sc, f1040sse, f1040se, f8995, f2555)
+- [ ] **Visually verify PDF field mappings** — IRS does not label fields semantically; exact line-to-field mapping needs visual spot-check against filled test PDFs
 - [ ] **Collect tax documents** — 1099-NEC, K-1, health insurance records, estimated payment confirmations, business expenses
 - [ ] **Collect personal info** — SSN, foreign address, EINs, NAICS codes, property manager EIN
 - [ ] **Parse prior returns** — 2023 and 2024 for comparison and safe harbor calculation
@@ -89,11 +96,21 @@
 - [ ] Form 8960 (NIIT) — calculation exists but no PDF mapping
 - [ ] Schedule 1 / Schedule 2 field mappings — adjustments and additional taxes
 
+### Codex Review — Skipped Issues
+
+A GPT Codex review identified 10 issues. We triaged and implemented the 4 highest-impact fixes (see Phase 8 above). The remaining 6 were deferred for these reasons:
+
+- **Schedule A (itemized deductions)** — Skipped because our primary use case (self-employed MFS expat) almost always takes the standard deduction. SALT cap at $10K makes itemizing rarely beneficial for MFS. Would add significant complexity (mortgage interest, charitable contributions, medical expenses, SALT limitation) for a path most users won't take.
+- **Session resume data rehydration** — `--resume` restores step tracking but not the TaxpayerProfile data collected in earlier steps. Skipped because it requires serializing/deserializing the full profile model graph (including nested K-1s, 1099s, businesses). Currently users must re-enter data if resuming. Low priority since the wizard completes in one sitting.
+- **Document parsing → profile wiring** — `parse_documents.py` extracts data from PDFs but the results aren't automatically populated into TaxpayerProfile. Skipped because the wizard already has a manual review step (Step 4) where users confirm parsed values. Auto-wiring risks silently importing incorrect OCR results.
+- **Schedule 1 / Schedule 2 field mappings** — These supplemental forms aggregate adjustments and additional taxes that are already calculated and placed on the correct 1040 lines. Skipped because the IRS accepts the 1040 with these amounts inline; the schedules are only strictly required for e-file.
+- **Additional form PDFs** (Schedule D, Form 6251, Schedule 8812, Form 8960, Form 7206, Form 8829, Form 4562) — Calculations exist but no PDF field mappings. Skipped because each form requires downloading the IRS PDF, discovering field names, and building a mapping file. These can be added incrementally as needed.
+- **EITC** — Stub exists but MFS filers are categorically disqualified. Not applicable to our primary use case.
+
 ### Nice to Have
 
-- [ ] Capital gains preferential rates (qualified dividends/LTCG at 0%/15%/20%)
-- [ ] Schedule A (itemized deductions)
-- [ ] EITC (stub exists — MFS disqualified)
+- [x] ~~Capital gains preferential rates (qualified dividends/LTCG at 0%/15%/20%)~~ — Implemented in Phase 8 (QDCG worksheet)
+- [ ] Schedule A (itemized deductions) — see Codex Review notes above
 - [ ] Schedule B form generation (threshold tracking only)
 - [ ] QBI loss carryforward tracking across tax years
 - [ ] Suspended passive loss carryforward tracking

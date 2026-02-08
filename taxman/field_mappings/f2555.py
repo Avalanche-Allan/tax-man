@@ -1,4 +1,10 @@
-"""Field mapping for Form 2555 (Foreign Earned Income Exclusion)."""
+"""Field mapping for Form 2555 (Foreign Earned Income Exclusion).
+
+Field names from inspect_form_fields('f2555') against 2025 IRS PDF.
+Page 1: f1_1..f1_54 (Parts I-III: General info, qualifying tests)
+Page 2: f2_1..f2_53 (Parts IV-VI: Income, deductions, exclusion)
+Page 3: f3_1..f3_27 (Parts VII-IX: Housing)
+"""
 
 from taxman.field_mappings.common import (
     checkbox,
@@ -17,31 +23,43 @@ def build_2555_data(feie_result, profile=None) -> dict:
     data = {}
 
     if profile:
-        data["f1_01"] = f"{profile.first_name} {profile.last_name}"
-        data["f1_02"] = format_ssn(profile.ssn)
+        # Header
+        data["f1_1[0]"] = f"{profile.first_name} {profile.last_name}"
+        data["f1_2[0]"] = profile.ssn.replace("-", "") if profile.ssn else ""
 
         # Part I: General Information
-        data["f1_03"] = profile.foreign_country
-        data["f1_04"] = profile.street_address
-        data["f1_05"] = profile.city
+        # f1_3: Line 1 — Foreign country name
+        data["f1_3[0]"] = profile.foreign_country
+        # f1_4: Line 2 — Foreign address
+        data["f1_4[0]"] = profile.street_address
+        # f1_5: Line 3 — City
+        data["f1_5[0]"] = profile.city
+        # f1_6: Line 4a — Employer name
+        # f1_7: Line 4b — Employer address
 
-        # Foreign address
-        if profile.foreign_address:
-            data["f1_06"] = profile.country
+        # Part III: Physical Presence Test
+        # c1_4: Checkbox for physical presence test
+        data["c1_4[0]"] = True
+        # f1_17: Line 16 — Days present in foreign country
+        data["f1_17[0]"] = str(profile.days_in_foreign_country_2025)
 
-        # Physical presence test
-        data["f1_physical_presence"] = checkbox(True)
-        data["f1_days_abroad"] = str(profile.days_in_foreign_country_2025)
-
+    # ── Page 2: Parts IV-VI ──
     # Part IV: Foreign Earned Income
-    data["f1_line19"] = format_currency_for_pdf(feie_result.foreign_earned_income)
+    # f2_1: Line 19 — Wages/salaries/tips
+    # f2_2: Line 20 — Allowances, reimbursements, etc.
+    # f2_3: Line 21 — Total foreign earned income
+    # For self-employed, line 22 (Schedule C net profit):
+    data["f2_4[0]"] = format_currency_for_pdf(feie_result.foreign_earned_income)
+    # f2_5: Line 23 — Other foreign earned income
+    # f2_6: Line 24 — Add lines 19-23
+    data["f2_6[0]"] = format_currency_for_pdf(feie_result.foreign_earned_income)
 
-    # Part V: Exclusion
-    data["f1_line42"] = format_currency_for_pdf(feie_result.exclusion_amount)
+    # Part V: Figuring the Foreign Earned Income Exclusion
+    # f2_25: Line 42 — Foreign earned income exclusion
+    data["f2_25[0]"] = format_currency_for_pdf(feie_result.exclusion_amount)
 
-    # Analysis
-    data["f1_tax_with"] = format_currency_for_pdf(feie_result.tax_with_feie)
-    data["f1_tax_without"] = format_currency_for_pdf(feie_result.tax_without_feie)
-    data["f1_savings"] = format_currency_for_pdf(feie_result.savings)
+    # f2_26: Line 43 — Housing deduction
+    # f2_27: Line 44 — Total exclusion
+    data["f2_27[0]"] = format_currency_for_pdf(feie_result.exclusion_amount)
 
     return data

@@ -85,7 +85,7 @@ Sessions are stored in `~/.taxman/sessions/`.
 
 ### Federal
 
-- **Form 1040** — AGI, taxable income, total tax, refund/owed, Lines 1-9 (wages, interest, dividends, capital gains)
+- **Form 1040** — AGI, taxable income, total tax, refund/owed, Lines 1-9 (wages, interest, dividends, capital gains). Qualified dividends and LTCG taxed at preferential 0%/15%/20% rates via QDCG worksheet
 - **Schedule C** (multiple businesses) — gross income, categorized expenses, net profit/loss, home office (simplified + regular with mortgage/RE taxes), COGS
 - **Schedule D** — capital gains/losses from 1099-B, K-1 Boxes 8/9a/10, 1099-DIV Box 2a; loss limitation ($3,000 / $1,500 MFS)
 - **Schedule SE** — self-employment tax (SS + Medicare split), deductible half, W-2 SS wage base coordination
@@ -136,7 +136,7 @@ generate_all_forms(result, profile, output_dir="output/")
 
 IRS form PDFs are expected in `forms/` (or set `TAXMAN_FORMS_DIR` env var). Download the 2025 fillable PDFs from irs.gov.
 
-**Note:** PDF field names in `taxman/field_mappings/` are placeholders. Run `inspect_form_fields_raw()` against the actual 2025 IRS PDFs to discover real field names, then update the mappings.
+**Note:** PDF field names in `taxman/field_mappings/` were mapped from real 2025 IRS fillable PDFs via `inspect_form_fields()`. However, IRS does not label fields semantically — exact line-to-field mapping should be visually verified before filing.
 
 ## Reports
 
@@ -202,7 +202,7 @@ print(f"CO tax: ${co_result.co_tax_after_apportion:,.2f}")
 ## Testing
 
 ```bash
-# Run all 287 tests
+# Run all 301 tests
 pytest
 
 # With coverage
@@ -216,7 +216,7 @@ Test files:
 
 | File | Tests | Covers |
 |------|-------|--------|
-| `test_calculator.py` | 122 | All tax calculations, brackets, SE, QBI, FEIE, NIIT, AMT, credits, investment income, Schedule D, K-1 boxes |
+| `test_calculator.py` | 136 | All tax calculations, brackets, SE, QBI, FEIE, NIIT, AMT, credits, QDCG worksheet, 1099-NEC routing, investment income, Schedule D, K-1 boxes |
 | `test_models.py` | 84 | Dataclass validation, properties, edge cases, parsing, form filling |
 | `test_integration.py` | 61 | Full return scenarios (MFS expat, freelancer, MFJ), consistency |
 | `test_colorado.py` | 20 | CO source income, Form 104, apportionment, SALT addback, pension subtraction |
@@ -256,10 +256,10 @@ tax-man/
       f8995.py                    # Form 8995 (QBI) field mapping
       f2555.py                    # Form 2555 (FEIE) field mapping
 
-  tests/                          # pytest suite (287 tests)
+  tests/                          # pytest suite (301 tests)
     conftest.py                   # Shared fixtures
     fixtures/profiles.py          # Factory functions for test profiles
-    test_calculator.py            # 122 tests — brackets, SE, QBI, FEIE, NIIT, AMT, credits, Schedule D
+    test_calculator.py            # 136 tests — brackets, SE, QBI, FEIE, NIIT, AMT, credits, QDCG, NEC, Schedule D
     test_models.py                # 84 tests — validation, properties, parsing, form filling
     test_integration.py           # 61 tests — full return scenarios, consistency
     test_colorado.py              # 20 tests — CO source income, Form 104, SALT, pension

@@ -496,6 +496,11 @@ class TaxWizard:
             scenarios = compare_feie_scenarios(self.profile)
             display_feie_comparison(scenarios)
 
+            # Persist FEIE result for PDF generation (Form 2555)
+            feie_result = scenarios.get("feie_result")
+            if feie_result and feie_result.is_beneficial:
+                self.result.feie = feie_result
+
         # General optimization recommendations
         console.print("\n[bold]Optimization Recommendations[/bold]")
         recs = generate_optimization_recommendations(self.result, self.profile)
