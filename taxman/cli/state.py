@@ -29,6 +29,7 @@ class SessionState:
     personal_info: dict = field(default_factory=dict)
     documents_dir: str = ""
     parsed_documents: list[dict] = field(default_factory=list)
+    scan_results: dict = field(default_factory=dict)
 
     # Full profile (replaces fragmented income_data/expense_data/etc.)
     profile_data: dict = field(default_factory=dict)

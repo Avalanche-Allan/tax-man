@@ -14,11 +14,14 @@ from typing import Optional
 import typer
 from rich.console import Console
 
+from taxman.cli.headless import headless_app
+
 app = typer.Typer(
     name="taxman",
     help="Tax Man — 2025 Federal Tax Return Preparation",
     add_completion=False,
 )
+app.add_typer(headless_app, name="headless")
 console = Console()
 
 
