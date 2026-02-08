@@ -13,6 +13,8 @@ from taxman.constants import (
     ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
     ADDITIONAL_MEDICARE_THRESHOLD_SINGLE,
     ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS,
+    ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_SINGLE,
+    ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFJ,
     ESTIMATED_TAX_PRIOR_YEAR_HIGH_INCOME_PCT,
     ESTIMATED_TAX_PRIOR_YEAR_PCT,
     ESTIMATED_TAX_SAFE_HARBOR_PCT,
@@ -23,6 +25,8 @@ from taxman.constants import (
     SINGLE_BRACKETS,
     NIIT_RATE,
     NIIT_THRESHOLD_MFS,
+    NIIT_THRESHOLD_SINGLE,
+    NIIT_THRESHOLD_MFJ,
     QBI_DEDUCTION_RATE,
     QBI_PHASEOUT_MFS,
     QBI_PHASEOUT_MFJ,
@@ -66,6 +70,24 @@ ADDITIONAL_MEDICARE_THRESHOLDS = {
     FilingStatus.MFJ: ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
     FilingStatus.HOH: ADDITIONAL_MEDICARE_THRESHOLD_SINGLE,
     FilingStatus.QSS: ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
+}
+
+# Bug 1 fix: NIIT thresholds by filing status
+NIIT_THRESHOLDS = {
+    FilingStatus.SINGLE: NIIT_THRESHOLD_SINGLE,
+    FilingStatus.MFS: NIIT_THRESHOLD_MFS,
+    FilingStatus.MFJ: NIIT_THRESHOLD_MFJ,
+    FilingStatus.HOH: NIIT_THRESHOLD_SINGLE,
+    FilingStatus.QSS: NIIT_THRESHOLD_MFJ,
+}
+
+# Bug 4 fix: Estimated tax high-income thresholds by filing status
+ESTIMATED_TAX_HIGH_INCOME_THRESHOLDS = {
+    FilingStatus.SINGLE: ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_SINGLE,
+    FilingStatus.MFS: ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS,
+    FilingStatus.MFJ: ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFJ,
+    FilingStatus.HOH: ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_SINGLE,
+    FilingStatus.QSS: ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFJ,
 }
 
 
@@ -417,6 +439,8 @@ def calculate_qbi_deduction(
     taxable_income_before_qbi: float,
     schedule_c_results: list[ScheduleCResult],
     filing_status: FilingStatus = FilingStatus.MFS,
+    w2_wages: float = 0.0,
+    ubia: float = 0.0,
 ) -> Form8995Result:
     """Calculate QBI deduction (Form 8995/8995-A).
 
@@ -463,13 +487,15 @@ def calculate_qbi_deduction(
                               f"${threshold:,}. 20% × ${total_qbi:,.2f} = "
                               f"${total_qbi * QBI_DEDUCTION_RATE:,.2f}"))
     else:
-        # Above threshold — W-2 wage / UBIA limitations
+        # Above threshold — W-2 wage / UBIA limitations (Bug 2 fix)
         result.is_limited = True
         excess = taxable_income_before_qbi - threshold
         phase_out_pct = min(excess / phaseout_range, 1.0)
 
-        # With no W-2 wages and no UBIA, the wage limitation = $0
-        limited_amount = 0.0
+        # W-2/UBIA limitation: greater of (50% of W-2 wages) or
+        # (25% of W-2 wages + 2.5% of UBIA)
+        wage_limit = max(w2_wages * 0.50, w2_wages * 0.25 + ubia * 0.025)
+        limited_amount = min(total_qbi * QBI_DEDUCTION_RATE, wage_limit)
         full_amount = total_qbi * QBI_DEDUCTION_RATE
         qbi_deduction = full_amount - (full_amount - limited_amount) * phase_out_pct
 
@@ -481,7 +507,9 @@ def calculate_qbi_deduction(
                               f"${taxable_income_before_qbi:,.2f} exceeds "
                               f"${threshold:,} by ${excess:,.2f}. "
                               f"Phase-out: {phase_out_pct:.1%}. "
-                              f"No W-2 wages paid = $0 wage limitation."))
+                              f"W-2 wages: ${w2_wages:,.2f}, "
+                              f"UBIA: ${ubia:,.2f}, "
+                              f"Wage limit: ${wage_limit:,.2f}."))
 
     result.lines = lines
     return result
@@ -531,7 +559,8 @@ def calculate_niit(
     IRC §1411. Applies to lesser of net investment income or
     AGI excess over threshold. Threshold for MFS is $125,000.
     """
-    threshold = NIIT_THRESHOLD_MFS  # Same as Additional Medicare for MFS
+    # Bug 1 fix: use filing-status-specific threshold
+    threshold = NIIT_THRESHOLDS.get(filing_status, NIIT_THRESHOLD_MFS)
     agi_excess = max(agi - threshold, 0)
     taxable_nii = min(net_investment_income, agi_excess)
     return round(taxable_nii * NIIT_RATE, 2)
@@ -591,7 +620,9 @@ def evaluate_feie(
     # Stacking method: use actual taxable income, not raw earned income
     # Tax on full taxable income (already computed as tax_without_feie)
     # Tax on excluded portion (at the bottom of the bracket stack)
-    tax_on_excluded = calculate_income_tax(exclusion)
+    # Bug 3 fix: use correct brackets for filing status
+    brackets = BRACKETS_BY_STATUS.get(profile.filing_status, MFS_BRACKETS)
+    tax_on_excluded = calculate_income_tax(exclusion, brackets)
     tax_with_feie = max(tax_without_feie - tax_on_excluded, 0)
 
     result.tax_with_feie = round(tax_with_feie, 2)
@@ -850,14 +881,21 @@ def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
     }
 
 
-def estimate_quarterly_payments(total_tax: float, prior_year_tax: float,
-                                agi: float) -> dict:
+def estimate_quarterly_payments(
+    total_tax: float,
+    prior_year_tax: float,
+    agi: float,
+    filing_status: FilingStatus = FilingStatus.MFS,
+) -> dict:
     """Estimate recommended quarterly payments for next year.
 
-    Safe harbor: pay 100% of prior year tax (110% if AGI > $75K MFS)
+    Safe harbor: pay 100% of prior year tax (110% if AGI > threshold)
     or 90% of current year tax, whichever is less.
+    Bug 4 fix: uses filing-status-specific high-income threshold.
     """
-    threshold = ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS
+    threshold = ESTIMATED_TAX_HIGH_INCOME_THRESHOLDS.get(
+        filing_status, ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS
+    )
     prior_year_pct = (ESTIMATED_TAX_PRIOR_YEAR_HIGH_INCOME_PCT
                       if agi > threshold
                       else ESTIMATED_TAX_PRIOR_YEAR_PCT)
@@ -879,3 +917,82 @@ def estimate_quarterly_payments(total_tax: float, prior_year_tax: float,
             else "90% of current year tax"
         ),
     }
+
+
+# =============================================================================
+# Optimization Recommendations
+# =============================================================================
+
+def generate_optimization_recommendations(
+    result: Form1040Result,
+    profile: TaxpayerProfile,
+) -> list[dict]:
+    """Generate ranked optimization suggestions based on the return.
+
+    Returns a list of dicts with 'title', 'description', 'estimated_savings'.
+    """
+    recommendations = []
+
+    # Check FEIE benefit
+    if profile.days_in_foreign_country_2025 >= 330:
+        earned_income = sum(sc.net_profit_loss for sc in result.schedule_c_results)
+        if earned_income > 0:
+            feie_eval = evaluate_feie(
+                profile,
+                result.taxable_income,
+                result.tax,
+                max(earned_income, 0),
+            )
+            if feie_eval.is_beneficial:
+                recommendations.append({
+                    "title": "Claim Foreign Earned Income Exclusion",
+                    "description": (
+                        f"You qualify for FEIE with {profile.days_in_foreign_country_2025} "
+                        f"days abroad. Excludes up to ${FEIE_EXCLUSION_LIMIT:,} from income tax."
+                    ),
+                    "estimated_savings": feie_eval.savings,
+                })
+
+    # Check retirement contributions
+    se_income = sum(sc.net_profit_loss for sc in result.schedule_c_results)
+    if se_income > 50_000:
+        # SEP-IRA: 25% of net SE income (after deductible SE tax), max $69,000
+        se_tax_ded = result.schedule_se.deductible_se_tax if result.schedule_se else 0
+        sep_max = min((se_income - se_tax_ded) * 0.25, 69_000)
+        if sep_max > 0:
+            brackets = BRACKETS_BY_STATUS.get(profile.filing_status, MFS_BRACKETS)
+            # Estimate marginal rate
+            marginal_rate = 0.22
+            for upper, rate in brackets:
+                if result.taxable_income <= upper:
+                    marginal_rate = rate
+                    break
+            est_savings = round(sep_max * marginal_rate, 2)
+            recommendations.append({
+                "title": "SEP-IRA Contribution",
+                "description": (
+                    f"Contribute up to ${sep_max:,.0f} to a SEP-IRA to reduce "
+                    f"taxable income. Deadline is filing deadline (including extensions)."
+                ),
+                "estimated_savings": est_savings,
+            })
+
+    # Check home office optimization
+    for biz in profile.businesses:
+        if biz.home_office and biz.home_office.use_simplified_method:
+            if biz.home_office.total_home_sqft > 0 and biz.home_office.office_sqft > 0:
+                regular = biz.home_office.regular_deduction
+                simplified = biz.home_office.simplified_deduction
+                if regular > simplified:
+                    recommendations.append({
+                        "title": f"Switch {biz.business_name} to regular home office method",
+                        "description": (
+                            f"Regular method deduction: ${regular:,.2f} vs "
+                            f"simplified: ${simplified:,.2f}."
+                        ),
+                        "estimated_savings": round(regular - simplified, 2),
+                    })
+
+    # Sort by estimated savings descending
+    recommendations.sort(key=lambda r: r["estimated_savings"], reverse=True)
+    return recommendations

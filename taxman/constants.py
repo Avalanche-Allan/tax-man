@@ -141,6 +141,8 @@ ESTIMATED_TAX_SAFE_HARBOR_PCT = 0.90  # 90% of current year
 ESTIMATED_TAX_PRIOR_YEAR_PCT = 1.00  # 100% of prior year (AGI <= $75K MFS)
 ESTIMATED_TAX_PRIOR_YEAR_HIGH_INCOME_PCT = 1.10  # 110% (AGI > $75K MFS)
 ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS = 75_000  # Half of MFJ $150K
+ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_SINGLE = 150_000
+ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFJ = 150_000
 ESTIMATED_TAX_DE_MINIMIS = 1_000  # No penalty if balance due < $1,000
 UNDERPAYMENT_PENALTY_RATE = 0.07  # ~7% for 2025 (fed short-term + 3%)
 
@@ -161,6 +163,8 @@ SALT_PHASEOUT_INCOME = 500_000  # Cap reduces above this AGI
 
 # Net Investment Income Tax (IRC §1411)
 NIIT_THRESHOLD_MFS = 125_000
+NIIT_THRESHOLD_SINGLE = 200_000
+NIIT_THRESHOLD_MFJ = 250_000
 NIIT_RATE = 0.038  # 3.8%
 
 # AMT exemption (IRC §55, Form 6251)
@@ -201,3 +205,19 @@ Q1_ESTIMATED_DUE = "April 15, 2025"
 Q2_ESTIMATED_DUE = "June 16, 2025"  # June 15 is Sunday
 Q3_ESTIMATED_DUE = "September 15, 2025"
 Q4_ESTIMATED_DUE = "January 15, 2026"
+
+
+# =============================================================================
+# COLORADO STATE TAX (Tax Year 2025)
+# Source: CO Revised Statutes §39-22-104; CO Dept. of Revenue
+# =============================================================================
+
+CO_TAX_RATE = 0.044  # 4.4% flat rate for 2025
+CO_STANDARD_DEDUCTION = {
+    "single": 15_750,
+    "mfj": 31_500,
+    "mfs": 15_750,
+    "hoh": 23_625,
+    "qss": 31_500,
+}
+CO_FILING_DEADLINE = "April 15, 2026"

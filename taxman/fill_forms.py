@@ -28,7 +28,9 @@ IRS_FORM_URLS = {
     "f8995a": "https://www.irs.gov/pub/irs-pdf/f8995a.pdf",     # QBI full
 }
 
-FORMS_DIR = Path("/home/user/taxman/forms")
+# Bug 7 fix: Use package-relative path with env var override
+_DEFAULT_FORMS_DIR = Path(__file__).resolve().parent.parent / "forms"
+FORMS_DIR = Path(os.environ.get("TAXMAN_FORMS_DIR", str(_DEFAULT_FORMS_DIR)))
 
 
 def download_irs_form(form_key: str, force: bool = False) -> Path:
@@ -61,28 +63,17 @@ def download_all_forms(force: bool = False):
 def inspect_form_fields(form_key: str) -> dict:
     """Inspect a PDF form to discover its fillable field names and types.
 
-    This is essential for building the field mapping — we need to know
-    the exact PDF field names to fill them programmatically.
+    Bug 10 fix: Single clean iteration over wrapper.schema.items().
     """
     pdf_path = download_irs_form(form_key)
     wrapper = PdfWrapper(str(pdf_path))
 
     fields = {}
-    for page_num, page_fields in enumerate(wrapper.schema.items()):
-        field_name, field_info = page_fields
+    for field_name, field_info in wrapper.schema.items():
         fields[field_name] = {
             "type": str(type(field_info).__name__),
             "value": str(field_info) if field_info else None,
         }
-
-    # Alternative: use schema property which gives all fields
-    try:
-        schema = wrapper.schema
-        for name, info in schema.items():
-            if name not in fields:
-                fields[name] = {"type": "unknown", "value": str(info)}
-    except Exception:
-        pass
 
     return fields
 
@@ -148,3 +139,97 @@ def fill_and_flatten(form_key: str, data: dict, output_path: str) -> str:
 
     print(f"Filled and flattened {form_key} → {output}")
     return str(output)
+
+
+# =============================================================================
+# Form Generation Pipeline (Phase 6)
+# =============================================================================
+
+def generate_all_forms(result, profile, output_dir: str) -> list[str]:
+    """Orchestrate generation of all required tax forms.
+
+    Args:
+        result: Form1040Result from calculator
+        profile: TaxpayerProfile
+        output_dir: Directory to save generated PDFs
+
+    Returns:
+        List of paths to generated PDFs
+    """
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    generated = []
+
+    # Import field mapping builders lazily to avoid circular imports
+    try:
+        from taxman.field_mappings import (
+            build_1040_data,
+            build_schedule_c_data,
+            build_schedule_e_data,
+            build_schedule_se_data,
+            build_8995_data,
+            build_2555_data,
+        )
+    except ImportError:
+        print("Field mappings not yet configured — skipping form generation.")
+        return generated
+
+    # Form 1040
+    try:
+        data_1040 = build_1040_data(result, profile)
+        path = fill_form("f1040", data_1040, str(output / "f1040_filled.pdf"))
+        generated.append(path)
+    except Exception as e:
+        print(f"Error generating 1040: {e}")
+
+    # Schedule C (one per business)
+    for i, sc_result in enumerate(result.schedule_c_results):
+        try:
+            biz = profile.businesses[i] if i < len(profile.businesses) else None
+            data_sc = build_schedule_c_data(sc_result, biz, profile)
+            path = fill_form(
+                "f1040sc", data_sc,
+                str(output / f"schedule_c_{i+1}_filled.pdf")
+            )
+            generated.append(path)
+        except Exception as e:
+            print(f"Error generating Schedule C #{i+1}: {e}")
+
+    # Schedule SE
+    if result.schedule_se and result.schedule_se.se_tax > 0:
+        try:
+            data_se = build_schedule_se_data(result.schedule_se, profile)
+            path = fill_form("f1040sse", data_se, str(output / "schedule_se_filled.pdf"))
+            generated.append(path)
+        except Exception as e:
+            print(f"Error generating Schedule SE: {e}")
+
+    # Schedule E
+    if result.schedule_e:
+        try:
+            data_e = build_schedule_e_data(result.schedule_e, profile)
+            path = fill_form("f1040se", data_e, str(output / "schedule_e_filled.pdf"))
+            generated.append(path)
+        except Exception as e:
+            print(f"Error generating Schedule E: {e}")
+
+    # Form 8995 (QBI)
+    if result.qbi and result.qbi.qbi_deduction > 0:
+        try:
+            data_qbi = build_8995_data(result.qbi, result, profile)
+            form_key = "f8995a" if result.qbi.is_limited else "f8995"
+            path = fill_form(form_key, data_qbi, str(output / "f8995_filled.pdf"))
+            generated.append(path)
+        except Exception as e:
+            print(f"Error generating Form 8995: {e}")
+
+    # Form 2555 (FEIE) — only if beneficial
+    if result.feie and result.feie.is_beneficial:
+        try:
+            data_2555 = build_2555_data(result.feie, profile)
+            path = fill_form("f2555", data_2555, str(output / "f2555_filled.pdf"))
+            generated.append(path)
+        except Exception as e:
+            print(f"Error generating Form 2555: {e}")
+
+    return generated

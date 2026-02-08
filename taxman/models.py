@@ -4,6 +4,15 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from taxman.validation import (
+    validate_ein,
+    validate_months,
+    validate_non_negative,
+    validate_percentage,
+    validate_quarter,
+    validate_tin,
+)
+
 
 class FilingStatus(Enum):
     SINGLE = "single"
@@ -38,6 +47,19 @@ class Form1099NEC:
     state: str = ""
     tax_year: int = 2025
 
+    def __post_init__(self):
+        if self.payer_tin:
+            self.payer_tin = validate_ein(self.payer_tin, "payer_tin")
+        if self.recipient_tin:
+            # Could be SSN or EIN
+            try:
+                self.recipient_tin = validate_tin(self.recipient_tin, "recipient_tin")
+            except Exception:
+                self.recipient_tin = validate_ein(self.recipient_tin, "recipient_tin")
+        validate_non_negative(self.nonemployee_compensation, "nonemployee_compensation")
+        validate_non_negative(self.federal_tax_withheld, "federal_tax_withheld")
+        validate_non_negative(self.state_tax_withheld, "state_tax_withheld")
+
 
 @dataclass
 class ScheduleK1:
@@ -65,6 +87,15 @@ class ScheduleK1:
     self_employment_earnings: float = 0.0  # Box 14
     tax_year: int = 2025
 
+    def __post_init__(self):
+        if self.partnership_ein:
+            self.partnership_ein = validate_ein(self.partnership_ein, "partnership_ein")
+        if self.partner_tin:
+            try:
+                self.partner_tin = validate_tin(self.partner_tin, "partner_tin")
+            except Exception:
+                self.partner_tin = validate_ein(self.partner_tin, "partner_tin")
+
 
 @dataclass
 class EstimatedPayment:
@@ -73,6 +104,10 @@ class EstimatedPayment:
     date_paid: str = ""
     amount: float = 0.0
 
+    def __post_init__(self):
+        validate_quarter(self.quarter, "quarter")
+        validate_non_negative(self.amount, "amount")
+
 
 @dataclass
 class HealthInsurance:
@@ -80,6 +115,95 @@ class HealthInsurance:
     provider: str = ""
     total_premiums: float = 0.0
     months_covered: int = 12
+
+    def __post_init__(self):
+        validate_non_negative(self.total_premiums, "total_premiums")
+        validate_months(self.months_covered, "months_covered")
+
+
+# --- New Document Types (Phase 3) ---
+
+@dataclass
+class FormW2:
+    """W-2: Wage and Tax Statement"""
+    employer_name: str = ""
+    employer_ein: str = ""
+    employee_name: str = ""
+    employee_ssn: str = ""
+    wages: float = 0.0  # Box 1
+    federal_tax_withheld: float = 0.0  # Box 2
+    ss_wages: float = 0.0  # Box 3
+    ss_tax_withheld: float = 0.0  # Box 4
+    medicare_wages: float = 0.0  # Box 5
+    medicare_tax_withheld: float = 0.0  # Box 6
+    state_wages: float = 0.0  # Box 16
+    state_tax_withheld: float = 0.0  # Box 17
+    state: str = ""
+    tax_year: int = 2025
+
+    def __post_init__(self):
+        if self.employer_ein:
+            self.employer_ein = validate_ein(self.employer_ein, "employer_ein")
+        if self.employee_ssn:
+            self.employee_ssn = validate_tin(self.employee_ssn, "employee_ssn")
+        validate_non_negative(self.wages, "wages")
+        validate_non_negative(self.federal_tax_withheld, "federal_tax_withheld")
+
+
+@dataclass
+class Form1098:
+    """1098: Mortgage Interest Statement"""
+    lender_name: str = ""
+    lender_ein: str = ""
+    mortgage_interest: float = 0.0  # Box 1
+    points_paid: float = 0.0  # Box 6
+    outstanding_principal: float = 0.0  # Box 2
+    tax_year: int = 2025
+
+    def __post_init__(self):
+        if self.lender_ein:
+            self.lender_ein = validate_ein(self.lender_ein, "lender_ein")
+        validate_non_negative(self.mortgage_interest, "mortgage_interest")
+        validate_non_negative(self.points_paid, "points_paid")
+
+
+@dataclass
+class Form1095A:
+    """1095-A: Health Insurance Marketplace Statement"""
+    marketplace_name: str = ""
+    policy_number: str = ""
+    monthly_premiums: list[float] = field(default_factory=lambda: [0.0] * 12)
+    monthly_slcsp: list[float] = field(default_factory=lambda: [0.0] * 12)
+    monthly_aptc: list[float] = field(default_factory=lambda: [0.0] * 12)
+    tax_year: int = 2025
+
+    @property
+    def total_premiums(self) -> float:
+        return sum(self.monthly_premiums)
+
+    @property
+    def total_slcsp(self) -> float:
+        return sum(self.monthly_slcsp)
+
+    @property
+    def total_aptc(self) -> float:
+        return sum(self.monthly_aptc)
+
+
+@dataclass
+class CharityReceipt:
+    """Charitable contribution receipt"""
+    organization_name: str = ""
+    organization_ein: str = ""
+    amount: float = 0.0
+    date: str = ""
+    cash_or_property: str = "cash"
+    description: str = ""
+
+    def __post_init__(self):
+        if self.organization_ein:
+            self.organization_ein = validate_ein(self.organization_ein, "organization_ein")
+        validate_non_negative(self.amount, "amount")
 
 
 # --- Business Expenses ---
@@ -142,7 +266,12 @@ class HomeOffice:
     insurance: float = 0.0
     repairs: float = 0.0
     internet: float = 0.0
-    internet_business_pct: float = 0.0
+    internet_business_pct: float = 0.0  # Stored as decimal (0.0 to 1.0)
+
+    def __post_init__(self):
+        # Bug 9 fix: normalize >1 values to decimal
+        if self.internet_business_pct > 1:
+            self.internet_business_pct = self.internet_business_pct / 100.0
 
     @property
     def simplified_deduction(self) -> float:
@@ -167,9 +296,8 @@ class HomeOffice:
             + self.insurance * pct
             + self.repairs * pct
         )
-        internet_deduction = self.internet * (self.internet_business_pct / 100.0
-                                              if self.internet_business_pct > 1
-                                              else self.internet_business_pct)
+        # Bug 9 fix: internet_business_pct is always decimal after __post_init__
+        internet_deduction = self.internet * self.internet_business_pct
         return (direct + internet_deduction) * (self.months_used / 12.0)
 
 
@@ -196,6 +324,13 @@ class ScheduleCData:
     # Expenses
     expenses: BusinessExpenses = field(default_factory=BusinessExpenses)
     home_office: Optional[HomeOffice] = None
+
+    def __post_init__(self):
+        if self.business_ein:
+            self.business_ein = validate_ein(self.business_ein, "business_ein")
+        validate_non_negative(self.gross_receipts, "gross_receipts")
+        validate_non_negative(self.returns_and_allowances, "returns_and_allowances")
+        validate_non_negative(self.cost_of_goods_sold, "cost_of_goods_sold")
 
     @property
     def gross_income(self) -> float:
@@ -271,6 +406,12 @@ class TaxpayerProfile:
 
     # State
     has_colorado_filing_obligation: bool = False  # Evaluate based on rental property
+
+    def __post_init__(self):
+        if self.ssn:
+            self.ssn = validate_tin(self.ssn, "ssn")
+        if self.spouse_ssn:
+            self.spouse_ssn = validate_tin(self.spouse_ssn, "spouse_ssn")
 
     @property
     def total_estimated_payments(self) -> float:

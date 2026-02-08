@@ -13,22 +13,38 @@ from taxman.constants import (
     FILING_DEADLINE,
     EXTENSION_DEADLINE,
 )
+from taxman.models import TaxpayerProfile, FilingStatus
 
 
-def generate_tax_summary(result: Form1040Result) -> str:
-    """Generate a plain-English summary of the tax return."""
+def generate_tax_summary(result: Form1040Result,
+                         profile: TaxpayerProfile = None) -> str:
+    """Generate a plain-English summary of the tax return.
+
+    Bug 8 fix: Derives filing status and situation from profile data.
+    """
     lines = []
     lines.append("=" * 60)
     lines.append("2025 FEDERAL TAX RETURN SUMMARY")
-    lines.append("Filing Status: Married Filing Separately")
+
+    if profile:
+        fs_display = profile.filing_status.value.upper()
+        lines.append(f"Filing Status: {fs_display}")
+        if profile.first_name or profile.last_name:
+            lines.append(f"Taxpayer: {profile.first_name} {profile.last_name}")
+    else:
+        lines.append("Filing Status: Married Filing Separately")
+
     lines.append("=" * 60)
     lines.append("")
 
     # Income
     lines.append("INCOME")
     lines.append("-" * 40)
-    for sc in result.schedule_c_results:
-        lines.append(f"  {sc.business_name}:")
+    for i, sc in enumerate(result.schedule_c_results):
+        biz_name = sc.business_name
+        if profile and i < len(profile.businesses):
+            biz_name = profile.businesses[i].business_name or biz_name
+        lines.append(f"  {biz_name}:")
         lines.append(f"    Gross receipts:    ${sc.gross_receipts:>12,.2f}")
         lines.append(f"    Total expenses:    ${sc.total_expenses:>12,.2f}")
         lines.append(f"    Net profit/loss:   ${sc.net_profit_loss:>12,.2f}")
@@ -176,33 +192,109 @@ def generate_line_detail(result: Form1040Result) -> str:
     return "\n".join(lines)
 
 
-def generate_filing_checklist() -> str:
-    """Generate filing checklist with deadlines and instructions."""
+def generate_filing_checklist(result: Form1040Result = None,
+                              profile: TaxpayerProfile = None) -> str:
+    """Generate filing checklist with deadlines and instructions.
+
+    Bug 8 fix: Builds form list from actual result data; derives
+    filing status and business info from profile.
+    """
+    # Determine filing situation from profile
+    if profile:
+        fs = profile.filing_status.value.upper()
+        is_abroad = profile.foreign_address
+        has_co = profile.has_colorado_filing_obligation
+    else:
+        fs = "MFS"
+        is_abroad = True
+        has_co = True
+
+    forms = []
+    forms.append("  [ ] Form 1040 — U.S. Individual Income Tax Return")
+    forms.append("  [ ] Schedule 1 — Additional Income and Adjustments")
+
+    # Schedule 2 if any additional taxes
+    has_sched2 = False
+    if result:
+        if result.se_tax > 0 or result.additional_medicare > 0 or result.niit > 0:
+            has_sched2 = True
+    else:
+        has_sched2 = True
+    if has_sched2:
+        forms.append("  [ ] Schedule 2 — Additional Taxes (SE tax, Addl Medicare)")
+
+    # Schedule C — one per business
+    if result and result.schedule_c_results:
+        for sc in result.schedule_c_results:
+            forms.append(f"  [ ] Schedule C — Profit or Loss ({sc.business_name})")
+    elif profile and profile.businesses:
+        for biz in profile.businesses:
+            forms.append(f"  [ ] Schedule C — Profit or Loss ({biz.business_name})")
+    else:
+        forms.append("  [ ] Schedule C — Profit or Loss From Business")
+
+    # Schedule SE
+    if (result and result.se_tax > 0) or not result:
+        forms.append("  [ ] Schedule SE — Self-Employment Tax")
+
+    # Schedule E
+    if (result and result.schedule_e) or (profile and profile.schedule_k1s):
+        forms.append("  [ ] Schedule E — Supplemental Income (K-1)")
+
+    # QBI
+    if result and result.qbi and result.qbi.qbi_deduction > 0:
+        form_num = "8995-A" if result.qbi.is_limited else "8995"
+        forms.append(f"  [ ] Form {form_num} — Qualified Business Income Deduction")
+    elif not result:
+        forms.append("  [ ] Form 8995 — Qualified Business Income Deduction")
+
+    # FEIE
+    if result and result.feie and result.feie.is_beneficial:
+        forms.append("  [ ] Form 2555 — Foreign Earned Income Exclusion")
+    elif not result and is_abroad:
+        forms.append("  [ ] Form 2555 — Foreign Earned Income Exclusion (if beneficial)")
+
+    # Additional Medicare
+    if (result and result.additional_medicare > 0) or not result:
+        forms.append("  [ ] Form 8959 — Additional Medicare Tax (if applicable)")
+
+    # NIIT
+    if (result and result.niit > 0) or not result:
+        forms.append("  [ ] Form 8960 — Net Investment Income Tax (if applicable)")
+
+    forms_str = "\n".join(forms)
+
+    abroad_note = ""
+    if is_abroad:
+        abroad_note = """
+ABROAD EXTENSION:
+  - As a US citizen abroad, you get an automatic 2-month
+    extension to June 15, 2026 (attach statement to return)
+  - Interest still accrues from April 15 on any amount owed"""
+
+    co_note = ""
+    if has_co:
+        co_note = """
+COLORADO STATE FILING:
+  - Evaluate obligation based on rental property income
+  - CO requires filing if you have CO-source income
+  - File Form 104 (Colorado Individual Income Tax Return)
+  - Deadline: April 15, 2026"""
+
     return f"""
-FILING CHECKLIST — 2025 Federal Tax Return
+FILING CHECKLIST — 2025 Federal Tax Return ({fs})
 {'=' * 50}
 
 FORMS TO FILE:
-  [ ] Form 1040 — U.S. Individual Income Tax Return
-  [ ] Schedule 1 — Additional Income and Adjustments
-  [ ] Schedule 2 — Additional Taxes (SE tax, Addl Medicare)
-  [ ] Schedule C — Profit or Loss From Business (Law Firm LLC)
-  [ ] Schedule C — Profit or Loss From Business (DocSherpa LLC)
-  [ ] Schedule SE — Self-Employment Tax
-  [ ] Schedule E — Supplemental Income (K-1 rental)
-  [ ] Form 8995 — Qualified Business Income Deduction
-  [ ] Form 2555 — Foreign Earned Income Exclusion (if beneficial)
-  [ ] Form 8959 — Additional Medicare Tax (if applicable)
-  [ ] Form 8960 — Net Investment Income Tax (if applicable)
+{forms_str}
 
 DEADLINES:
-  Regular deadline:     {FILING_DEADLINE}
-  Abroad auto-extend:  June 15, 2026 (attach statement)
+  Regular deadline:      {FILING_DEADLINE}
   Extension (Form 4868): {EXTENSION_DEADLINE}
+{abroad_note}
 
 FILING METHOD:
-  Since you're MFS with foreign address and self-employment,
-  e-filing via tax software is the easiest option.
+  E-filing via tax software is the easiest option.
   MeF-approved software can e-file 1040 with all schedules.
 
   If paper filing:
@@ -212,24 +304,24 @@ FILING METHOD:
              Austin, TX 73301-0002 (if refund)
 
 IMPORTANT NOTES:
-  - As a US citizen abroad, you get an automatic 2-month
-    extension to June 15, 2026 (attach statement to return)
-  - Interest still accrues from April 15 on any amount owed
   - Consider Form 4868 for extension to October 15 if needed
   - Estimated payments for 2026 are separate — see quarterly plan
-
-COLORADO STATE FILING:
-  - Evaluate obligation based on rental property income
-  - CO requires filing if you have CO-source income
-  - File Form 104 (Colorado Individual Income Tax Return)
-  - Deadline: April 15, 2026
+{co_note}
 """
 
 
 def generate_quarterly_plan(total_tax: float, prior_year_tax: float,
-                            agi: float) -> str:
-    """Generate 2026 estimated tax payment plan."""
-    est = estimate_quarterly_payments(total_tax, prior_year_tax, agi)
+                            agi: float,
+                            filing_status: FilingStatus = FilingStatus.MFS) -> str:
+    """Generate 2026 estimated tax payment plan.
+
+    Bug 4/8 fix: passes filing_status to estimate_quarterly_payments.
+    """
+    est = estimate_quarterly_payments(
+        total_tax, prior_year_tax, agi, filing_status=filing_status
+    )
+
+    threshold = ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS
 
     return f"""
 2026 ESTIMATED TAX PAYMENT PLAN
@@ -241,7 +333,7 @@ Based on 2025 return:
 
 Safe harbor calculation:
   90% of 2025 tax:         ${est['safe_harbor_current_year']:>12,.2f}
-  {'110' if agi > ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS else '100'}% of 2024 tax:         ${est['safe_harbor_prior_year']:>12,.2f}
+  {'110' if agi > threshold else '100'}% of 2024 tax:         ${est['safe_harbor_prior_year']:>12,.2f}
   Method used:             {est['method']}
 
 RECOMMENDED QUARTERLY PAYMENTS:
@@ -256,3 +348,66 @@ RECOMMENDED QUARTERLY PAYMENTS:
 Pay via IRS Direct Pay: https://www.irs.gov/payments
 Or EFTPS: https://www.eftps.gov
 """
+
+
+def generate_feie_comparison_report(scenarios: dict) -> str:
+    """Generate detailed FEIE comparison report."""
+    wo = scenarios["without_feie"]
+    fe = scenarios["feie_evaluation"]
+
+    lines = []
+    lines.append("FEIE COMPARISON ANALYSIS")
+    lines.append("=" * 60)
+    lines.append("")
+    lines.append("WITHOUT FEIE:")
+    lines.append(f"  Income tax:          ${wo['income_tax']:>12,.2f}")
+    lines.append(f"  SE tax:              ${wo['se_tax']:>12,.2f}")
+    lines.append(f"  Addl Medicare:       ${wo['additional_medicare']:>12,.2f}")
+    if wo['niit'] > 0:
+        lines.append(f"  NIIT:                ${wo['niit']:>12,.2f}")
+    lines.append(f"  Total tax:           ${wo['total_tax']:>12,.2f}")
+    lines.append("")
+    lines.append("WITH FEIE:")
+    lines.append(f"  Exclusion:           ${fe['exclusion_amount']:>12,.2f}")
+    lines.append(f"  Income tax:          ${fe['income_tax_with_feie']:>12,.2f}")
+    lines.append(f"  SE tax (unchanged):  ${fe['se_tax_unchanged']:>12,.2f}")
+    lines.append("")
+    lines.append(f"  Income tax savings:  ${fe['income_tax_savings']:>12,.2f}")
+    lines.append("")
+    lines.append(f"  RECOMMENDATION: {scenarios['recommendation']}")
+
+    return "\n".join(lines)
+
+
+def generate_prior_year_comparison(current: Form1040Result,
+                                   prior: dict) -> str:
+    """Generate year-over-year comparison report.
+
+    Args:
+        current: Current year Form1040Result
+        prior: Dict with prior year values (total_income, agi, total_tax, etc.)
+    """
+    lines = []
+    lines.append("YEAR-OVER-YEAR COMPARISON")
+    lines.append("=" * 60)
+    lines.append(f"{'':>25} {'Prior Year':>12} {'Current':>12} {'Change':>12}")
+    lines.append("-" * 60)
+
+    comparisons = [
+        ("Total Income", prior.get("total_income", 0), current.total_income),
+        ("AGI", prior.get("agi", 0), current.agi),
+        ("Taxable Income", prior.get("taxable_income", 0), current.taxable_income),
+        ("Income Tax", prior.get("tax", 0), current.tax),
+        ("SE Tax", prior.get("se_tax", 0), current.se_tax),
+        ("Total Tax", prior.get("total_tax", 0), current.total_tax),
+    ]
+
+    for label, prior_val, current_val in comparisons:
+        change = current_val - prior_val
+        sign = "+" if change > 0 else ""
+        lines.append(
+            f"  {label:<23} ${prior_val:>11,.2f} ${current_val:>11,.2f} "
+            f"{sign}${change:>10,.2f}"
+        )
+
+    return "\n".join(lines)
