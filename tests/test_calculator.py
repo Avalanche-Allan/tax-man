@@ -188,6 +188,28 @@ class TestCalculateScheduleC:
         assert result.gross_income == 143_000  # 140K + 3K
         assert result.net_profit_loss == 138_000  # 143K - 5K expenses
 
+    def test_employee_benefit_programs_deducted(self):
+        """Line 14: Employee benefit programs must be included in expenses."""
+        biz = ScheduleCData(
+            business_name="Benefits Biz",
+            gross_receipts=100_000,
+            expenses=BusinessExpenses(employee_benefit_programs=5_000),
+        )
+        result = calculate_schedule_c(biz)
+        assert result.total_expenses == 5_000
+        assert result.net_profit_loss == 95_000
+
+    def test_pension_profit_sharing_deducted(self):
+        """Line 19: Pension and profit-sharing must be included in expenses."""
+        biz = ScheduleCData(
+            business_name="Pension Biz",
+            gross_receipts=100_000,
+            expenses=BusinessExpenses(pension_profit_sharing=8_000),
+        )
+        result = calculate_schedule_c(biz)
+        assert result.total_expenses == 8_000
+        assert result.net_profit_loss == 92_000
+
 
 # =============================================================================
 # TestCalculateScheduleSE

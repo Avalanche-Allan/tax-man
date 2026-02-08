@@ -253,11 +253,13 @@ def calculate_schedule_c(biz: ScheduleCData) -> ScheduleCResult:
         ("10", "Commissions and fees", exp.commissions_and_fees),
         ("11", "Contract labor", exp.contract_labor),
         ("13", "Depreciation", exp.depreciation),
+        ("14", "Employee benefit programs", exp.employee_benefit_programs),
         ("15", "Insurance (other than health)", exp.insurance),
         ("16a", "Interest: mortgage", exp.interest_mortgage),
         ("16b", "Interest: other", exp.interest_other),
         ("17", "Legal and professional services", exp.legal_and_professional),
         ("18", "Office expense", exp.office_expense),
+        ("19", "Pension and profit-sharing plans", exp.pension_profit_sharing),
         ("20a", "Rent: vehicles/equipment", exp.rent_vehicles_equipment),
         ("20b", "Rent: other", exp.rent_other),
         ("21", "Repairs and maintenance", exp.repairs_maintenance),
@@ -353,7 +355,7 @@ def calculate_schedule_se(
     lines.append(LineItem("Schedule SE", "10",
                           "Social Security tax",
                           ss_tax,
-                          f"min(${taxable_se:,.2f}, ${SS_WAGE_BASE:,}) × {SS_TAX_RATE}"))
+                          f"min(${taxable_se:,.2f}, ${remaining_ss_base:,.2f}) × {SS_TAX_RATE}"))
     lines.append(LineItem("Schedule SE", "11",
                           "Medicare tax",
                           medicare_tax,
