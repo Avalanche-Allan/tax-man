@@ -259,13 +259,10 @@ tax-man/
   tests/                          # pytest suite (287 tests)
     conftest.py                   # Shared fixtures
     fixtures/profiles.py          # Factory functions for test profiles
-    test_calculator.py
-    test_models.py
-    test_validation.py
-    test_parse_documents.py
-    test_fill_forms.py
-    test_integration.py
-    test_colorado.py
+    test_calculator.py            # 122 tests — brackets, SE, QBI, FEIE, NIIT, AMT, credits, Schedule D
+    test_models.py                # 84 tests — validation, properties, parsing, form filling
+    test_integration.py           # 61 tests — full return scenarios, consistency
+    test_colorado.py              # 20 tests — CO source income, Form 104, SALT, pension
 
   forms/                          # IRS fillable PDFs (gitignored, download from irs.gov)
   data-2025/                      # Source tax documents (gitignored)
