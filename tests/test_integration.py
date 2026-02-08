@@ -94,6 +94,14 @@ class TestMFSExpatReturn:
         assert "Form 1040" in checklist
         assert "Schedule C" in checklist
 
+    def test_filing_checklist_no_abroad_extension_when_no_foreign_days(self, mfs_expat):
+        """Checklist should not show abroad extension when foreign days are zero."""
+        mfs_expat.foreign_address = True
+        mfs_expat.days_in_foreign_country_2025 = 0
+        result = calculate_return(mfs_expat)
+        checklist = generate_filing_checklist(result, mfs_expat)
+        assert "ABROAD EXTENSION" not in checklist
+
     def test_quarterly_plan(self, mfs_expat):
         result = calculate_return(mfs_expat)
         plan = generate_quarterly_plan(

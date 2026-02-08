@@ -203,7 +203,7 @@ def generate_filing_checklist(result: Form1040Result = None,
     # Determine filing situation from profile
     if profile:
         fs = profile.filing_status.value.upper()
-        is_abroad = profile.foreign_address
+        is_abroad = profile.days_in_foreign_country_2025 > 0
         has_co = profile.has_colorado_filing_obligation
     else:
         fs = "MFS"

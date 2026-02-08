@@ -1,8 +1,6 @@
 """Tests for wizard document parsing integration (Issue #4)."""
 
-import pytest
-from dataclasses import asdict
-from unittest.mock import patch, MagicMock
+from pathlib import Path
 
 from taxman.cli.wizard import TaxWizard
 from taxman.cli.state import SessionState
@@ -14,6 +12,14 @@ from taxman.models import (
     TaxpayerProfile,
 )
 from taxman.parse_documents import ParseResult
+
+
+class _Prompt:
+    def __init__(self, value):
+        self.value = value
+
+    def ask(self):
+        return self.value
 
 
 # =============================================================================
@@ -233,6 +239,48 @@ class TestParsedDocumentPersistence:
 
 
 # =============================================================================
+# Prior Return Parsing Integration
+# =============================================================================
+
+class TestPriorReturnCapture:
+    def test_prior_return_updates_profile_prior_year_tax(self, tmp_path, monkeypatch):
+        """Prior return Line 24 should populate profile.prior_year_tax."""
+        import taxman.cli.state as state_mod
+        monkeypatch.setattr(state_mod, "SESSIONS_DIR", tmp_path)
+
+        session = SessionState.create()
+        session.save()
+
+        wizard = TaxWizard(session=session)
+        wizard.scan_results = {
+            "documents": [
+                {
+                    "name": "prior-return.pdf",
+                    "path": "/docs/prior-return.pdf",
+                    "classification": "Prior Return",
+                },
+            ]
+        }
+
+        monkeypatch.setattr(
+            "taxman.cli.wizard.questionary.confirm",
+            lambda *args, **kwargs: _Prompt(True),
+        )
+        monkeypatch.setattr(
+            "taxman.cli.wizard.parse_prior_return",
+            lambda _path: {"data": {"Form 1040": {"line_24": 18432.55}}},
+        )
+
+        wizard._step_document_review()
+        assert wizard.profile.prior_year_tax == 18432.55
+
+        from taxman.cli.serialization import deserialize_profile
+        reloaded = SessionState.load(session.session_id)
+        restored = deserialize_profile(reloaded.profile_data)
+        assert restored.prior_year_tax == 18432.55
+
+
+# =============================================================================
 # Fix 1: Parsed Results Rehydration on Resume
 # =============================================================================
 
@@ -386,17 +434,21 @@ class TestForeignIncomeNotAbroadSave:
         session.save()
 
         wizard = TaxWizard(session=session)
+        monkeypatch.setattr(
+            "taxman.cli.wizard.questionary.confirm",
+            lambda *args, **kwargs: _Prompt(False),
+        )
+        wizard.profile.foreign_address = True
         wizard.profile.days_in_foreign_country_2025 = 330  # was abroad before
 
-        # Simulate "not abroad" — set days to 0 and save
-        wizard.profile.days_in_foreign_country_2025 = 0
-        wizard._save_profile()
+        wizard._step_foreign_income()
 
         # Reload and verify
         reloaded = SessionState.load(session.session_id)
         from taxman.cli.serialization import deserialize_profile
         restored = deserialize_profile(reloaded.profile_data)
         assert restored.days_in_foreign_country_2025 == 0
+        assert restored.foreign_address is False
 
 
 # =============================================================================
@@ -417,3 +469,38 @@ class TestGeneratedFormsSaved:
 
         reloaded = SessionState.load(session.session_id)
         assert reloaded.generated_forms == ["/output/f1040.pdf"]
+
+    def test_generate_forms_saves_actual_generated_file_paths(self, tmp_path, monkeypatch):
+        """Wizard should persist the specific files generated, not just the directory."""
+        import taxman.cli.state as state_mod
+        monkeypatch.setattr(state_mod, "SESSIONS_DIR", tmp_path)
+
+        session = SessionState.create()
+        session.save()
+
+        wizard = TaxWizard(session=session)
+        wizard.profile = TaxpayerProfile()
+
+        from taxman.calculator import calculate_return
+        wizard.result = calculate_return(wizard.profile)
+
+        output_dir = tmp_path / "generated"
+        fake_pdf = output_dir / "f1040.pdf"
+
+        monkeypatch.setattr(
+            "taxman.cli.wizard.questionary.text",
+            lambda *args, **kwargs: _Prompt(str(output_dir)),
+        )
+
+        def _fake_generate_all_forms(_result, _profile, _output_dir):
+            fake_pdf.parent.mkdir(parents=True, exist_ok=True)
+            fake_pdf.write_text("fake-pdf")
+            return [str(fake_pdf)]
+
+        monkeypatch.setattr("taxman.fill_forms.generate_all_forms", _fake_generate_all_forms)
+
+        wizard._step_generate_forms()
+
+        expected = {"tax_summary.txt", "filing_checklist.txt", "f1040.pdf"}
+        actual = {Path(path).name for path in wizard.session.generated_forms}
+        assert actual == expected

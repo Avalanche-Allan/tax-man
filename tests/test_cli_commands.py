@@ -1,10 +1,10 @@
 """Tests for CLI commands: export, review, compare (Issue #3)."""
 
 import json
-import pytest
-from pathlib import Path
+from typer.testing import CliRunner
 
 from taxman.calculator import calculate_return
+from taxman.cli.app import app
 from taxman.cli.serialization import serialize_profile, serialize_result
 from taxman.cli.state import SessionState
 from taxman.models import (
@@ -97,6 +97,23 @@ class TestExportCommand:
         assert "FEDERAL TAX RETURN SUMMARY" in summary_text
         assert "Freelance" in summary_text
         assert "80,000" in summary_text
+
+    def test_export_command_invocation_generates_files(self, tmp_path, monkeypatch):
+        """Invoke Typer export command end-to-end."""
+        _create_session_with_results(tmp_path, monkeypatch)
+        runner = CliRunner()
+        output_dir = tmp_path / "cli_export"
+
+        cli_result = runner.invoke(
+            app,
+            ["export", "test123", "--output-dir", str(output_dir)],
+        )
+
+        assert cli_result.exit_code == 0
+        assert (output_dir / "tax_summary.txt").exists()
+        assert (output_dir / "line_detail.txt").exists()
+        assert (output_dir / "filing_checklist.txt").exists()
+        assert (output_dir / "quarterly_plan.txt").exists()
 
     def test_export_fails_without_results(self, tmp_path, monkeypatch):
         """Export fails loudly when session has no results."""

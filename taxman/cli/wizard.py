@@ -248,6 +248,8 @@ class TaxWizard:
 
         parseable_types = set(self.PARSERS.keys()) | {"Prior Return"}
 
+        prior_year_tax_updated = False
+
         for doc in self.scan_results["documents"]:
             classification = doc.get("classification", "unknown")
             if classification not in parseable_types:
@@ -268,9 +270,18 @@ class TaxWizard:
             if classification == "Prior Return":
                 try:
                     prior_data = parse_prior_return(doc["path"])
-                    prior_tax = prior_data.get("data", {}).get("Form 1040", {}).get("line_24", 0)
-                    if prior_tax:
-                        console.print(f"  [green]Prior year total tax: {format_currency(prior_tax)}[/green]")
+                    prior_tax = prior_data.get("data", {}).get("Form 1040", {}).get("line_24")
+                    if prior_tax is not None:
+                        try:
+                            prior_val = float(str(prior_tax).replace(",", "").replace("$", ""))
+                        except (TypeError, ValueError):
+                            prior_val = 0.0
+
+                        self.profile.prior_year_tax = prior_val
+                        prior_year_tax_updated = True
+                        console.print(
+                            f"  [green]Prior year total tax: {format_currency(prior_val)}[/green]"
+                        )
                 except Exception as e:
                     console.print(f"  [yellow]Could not parse prior return: {e}[/yellow]")
                 continue
@@ -283,6 +294,9 @@ class TaxWizard:
                     self._display_parse_result(parse_result)
                 except Exception as e:
                     console.print(f"  [yellow]Could not parse {doc['name']}: {e}[/yellow]")
+
+        if prior_year_tax_updated:
+            self._save_profile()
 
         # Persist parsed documents to session
         self._save_parsed_documents()
@@ -672,10 +686,12 @@ class TaxWizard:
         ).ask()
 
         if not is_abroad:
+            self.profile.foreign_address = False
             self.profile.days_in_foreign_country_2025 = 0
             self._save_profile()
             return
 
+        self.profile.foreign_address = True
         country = questionary.text(
             "Foreign country:", default=self.profile.foreign_country or "Mexico"
         ).ask()
@@ -777,13 +793,19 @@ class TaxWizard:
         output_path = Path(output_dir)
         output_path.mkdir(parents=True, exist_ok=True)
 
-        summary = generate_tax_summary(self.result, self.profile)
-        (output_path / "tax_summary.txt").write_text(summary)
-        console.print("  [green]tax_summary.txt[/green]")
+        generated_forms = []
 
+        summary_path = output_path / "tax_summary.txt"
+        summary = generate_tax_summary(self.result, self.profile)
+        summary_path.write_text(summary)
+        console.print("  [green]tax_summary.txt[/green]")
+        generated_forms.append(str(summary_path))
+
+        checklist_path = output_path / "filing_checklist.txt"
         checklist = generate_filing_checklist(self.result, self.profile)
-        (output_path / "filing_checklist.txt").write_text(checklist)
+        checklist_path.write_text(checklist)
         console.print("  [green]filing_checklist.txt[/green]")
+        generated_forms.append(str(checklist_path))
 
         # Try PDF generation
         try:
@@ -791,11 +813,12 @@ class TaxWizard:
             forms = generate_all_forms(self.result, self.profile, output_dir)
             for f in forms:
                 console.print(f"  [green]{Path(f).name}[/green]")
+                generated_forms.append(str(f))
         except Exception as e:
             console.print(f"[yellow]PDF generation: {e}[/yellow]")
             console.print("[dim]Text reports were generated successfully.[/dim]")
 
-        self.session.generated_forms = [str(output_path)]
+        self.session.generated_forms = generated_forms
         self.session.save()
 
     # ── Step 13: Filing Checklist ────────────────────────────────────
