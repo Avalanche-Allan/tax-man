@@ -502,6 +502,9 @@ class TaxpayerProfile:
     foreign_country: str = "Mexico"
     foreign_tax_paid: float = 0.0  # Should be 0 per user
 
+    # Prior year (for quarterly estimated payment safe harbor)
+    prior_year_tax: float = 0.0
+
     # State
     has_colorado_filing_obligation: bool = False  # Evaluate based on rental property
     co_tabor_refund: float = 0.0

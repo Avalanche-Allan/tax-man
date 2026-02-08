@@ -159,8 +159,9 @@ def export(
     checklist_path.write_text(checklist)
     generated_files.append(checklist_path)
 
+    prior_year_tax = getattr(profile, "prior_year_tax", 0.0)
     quarterly = generate_quarterly_plan(
-        result.total_tax, 0.0, result.agi,
+        result.total_tax, prior_year_tax, result.agi,
         filing_status=profile.filing_status,
     )
     quarterly_path = out / "quarterly_plan.txt"

@@ -520,3 +520,21 @@ class TestGoldenFileSnapshots:
         # so we just verify the PDF was created successfully
         assert Path(output_path).exists()
         assert Path(output_path).stat().st_size > 10_000
+
+
+# =============================================================================
+# Fix 5: No Guessed Field Mappings
+# =============================================================================
+
+class TestNoGuessedMappings:
+    """Ensure no field mapping file contains guessed or placeholder mappings."""
+
+    def test_no_guess_comments_in_field_mappings(self):
+        """No field mapping Python file should contain 'guess' (defensive lint)."""
+        import glob
+        mapping_dir = Path(__file__).parent.parent / "taxman" / "field_mappings"
+        for py_file in sorted(mapping_dir.glob("*.py")):
+            content = py_file.read_text()
+            assert "guess" not in content.lower(), (
+                f"{py_file.name} contains 'guess' — all field mappings must be verified"
+            )

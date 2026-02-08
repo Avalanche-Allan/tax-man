@@ -12,7 +12,6 @@ from taxman.field_mappings.common import (
     checkbox,
     format_currency_for_pdf,
     format_ssn,
-    split_ssn,
 )
 
 
@@ -33,14 +32,9 @@ def build_1040_data(result, profile) -> dict:
     data["f1_01[0]"] = profile.first_name
     # f1_02: Your last name
     data["f1_02[0]"] = profile.last_name
-    # f1_03: SSN (first 2 digits — maxLength 2)
     # f1_04: Spouse first name
-    # f1_05-f1_10: SSN split fields (maxLength 2/4 pattern for xxx-xx-xxxx)
-    ssn1, ssn2, ssn3 = split_ssn(profile.ssn)
-    if ssn1:
-        data["f1_03[0]"] = ssn1[:2]
-        data["f1_05[0]"] = ssn1[2:] + ssn2[:1]  # This is a guess; IRS fields vary by year
-    # Full SSN in the dedicated field
+    # SSN: Use the full-SSN field only; split fields (f1_03/f1_05) have
+    # undocumented maxLength constraints that vary by year.
     data["f1_16[0]"] = profile.ssn.replace("-", "")
 
     # Filing status checkboxes (c1_1..c1_5 = Single, MFJ, MFS, HOH, QSS)

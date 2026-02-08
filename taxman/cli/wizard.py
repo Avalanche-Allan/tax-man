@@ -114,6 +114,10 @@ class TaxWizard:
         else:
             self.result = None
 
+        # Rehydrate parsed results from session (Fix 1: prefill lost on resume)
+        if self.session.parsed_documents:
+            self._rehydrate_parsed_results()
+
     def _save_profile(self):
         """Persist the current profile to the session."""
         self.session.profile_data = serialize_profile(self.profile)
@@ -333,6 +337,38 @@ class TaxWizard:
             self.session.parsed_documents.append(entry)
         self.session.save()
 
+    # Type string → model class mapping for rehydration
+    _PARSE_TYPE_MAP = {
+        "W-2": FormW2,
+        "1099-NEC": Form1099NEC,
+        "K-1": ScheduleK1,
+        "1098": Form1098,
+        "1095-A": Form1095A,
+        "Charity Receipt": CharityReceipt,
+    }
+
+    def _rehydrate_parsed_results(self):
+        """Rebuild self.parsed_results from session.parsed_documents on resume."""
+        for entry in self.session.parsed_documents:
+            doc_type = entry.get("type", "")
+            model_cls = self._PARSE_TYPE_MAP.get(doc_type)
+            data_dict = entry.get("data")
+            data_obj = None
+            if model_cls and isinstance(data_dict, dict):
+                try:
+                    data_obj = model_cls(**data_dict)
+                except Exception:
+                    pass
+
+            self.parsed_results.append(ParseResult(
+                data=data_obj,
+                confidence=entry.get("confidence", 0.0),
+                warnings=entry.get("warnings", []),
+                needs_manual_review=entry.get("needs_manual_review", False),
+                source_file=entry.get("file", ""),
+                document_type=doc_type,
+            ))
+
     def _apply_parsed_results(self):
         """Populate profile from parsed document results.
 
@@ -453,18 +489,37 @@ class TaxWizard:
                 business_type=BusinessType(biz_type or "single_member_llc"),
             ))
 
-        # K-1s
-        has_k1 = questionary.confirm("Do you have any K-1s?", default=bool(self.profile.schedule_k1s)).ask()
-        if has_k1:
-            num_k1 = questionary.text("How many K-1s?", default="1").ask()
+        # K-1s — preserve parsed data (Fix 2)
+        existing_k1s = self.profile.schedule_k1s
+        if existing_k1s:
+            console.print(f"\n[bold]K-1s ({len(existing_k1s)} from documents):[/bold]")
+            for i, k1 in enumerate(existing_k1s):
+                console.print(f"  {i+1}. {k1.partnership_name}")
+                if k1.ordinary_business_income:
+                    console.print(f"     Ordinary income: {format_currency(k1.ordinary_business_income)}")
+                if k1.net_rental_income:
+                    console.print(f"     Rental income: {format_currency(k1.net_rental_income)}")
+                if k1.guaranteed_payments:
+                    console.print(f"     Guaranteed payments: {format_currency(k1.guaranteed_payments)}")
+            keep = questionary.confirm(
+                "Keep these K-1s as imported?", default=True
+            ).ask()
+            if not keep:
+                existing_k1s = []
+
+        has_more = questionary.confirm(
+            "Add additional K-1s?" if existing_k1s else "Do you have any K-1s?",
+            default=not bool(existing_k1s),
+        ).ask()
+        if has_more:
+            num_k1 = questionary.text("How many K-1s to add?", default="1").ask()
             try:
                 num_k1 = int(num_k1)
             except (TypeError, ValueError):
                 num_k1 = 1
 
-            self.profile.schedule_k1s = []
             for i in range(num_k1):
-                console.print(f"\n[bold]K-1 #{i+1}[/bold]")
+                console.print(f"\n[bold]K-1 #{len(existing_k1s) + i + 1}[/bold]")
                 pname = questionary.text("Partnership name:").ask() or f"Partnership {i+1}"
                 rental = questionary.text("Net rental income ($, negative for loss):", default="0").ask()
                 try:
@@ -472,10 +527,12 @@ class TaxWizard:
                 except (ValueError, AttributeError):
                     rental_val = 0.0
 
-                self.profile.schedule_k1s.append(ScheduleK1(
+                existing_k1s.append(ScheduleK1(
                     partnership_name=pname,
                     net_rental_income=rental_val,
                 ))
+
+        self.profile.schedule_k1s = existing_k1s
 
         self._save_profile()
 
@@ -592,6 +649,16 @@ class TaxWizard:
                         EstimatedPayment(quarter=q, amount=amt_val)
                     )
 
+        # Prior year tax (for quarterly safe harbor calculation)
+        prior = questionary.text(
+            "Prior year total tax (for estimated payment safe harbor, $0 if N/A):",
+            default=str(int(self.profile.prior_year_tax)) if self.profile.prior_year_tax else "0",
+        ).ask()
+        try:
+            self.profile.prior_year_tax = float(prior.replace(",", "").replace("$", ""))
+        except (ValueError, AttributeError):
+            self.profile.prior_year_tax = 0.0
+
         self._save_profile()
 
     # ── Step 9: Foreign Income ───────────────────────────────────────
@@ -606,6 +673,7 @@ class TaxWizard:
 
         if not is_abroad:
             self.profile.days_in_foreign_country_2025 = 0
+            self._save_profile()
             return
 
         country = questionary.text(
@@ -728,6 +796,7 @@ class TaxWizard:
             console.print("[dim]Text reports were generated successfully.[/dim]")
 
         self.session.generated_forms = [str(output_path)]
+        self.session.save()
 
     # ── Step 13: Filing Checklist ────────────────────────────────────
 
@@ -737,16 +806,12 @@ class TaxWizard:
         checklist = generate_filing_checklist(self.result, self.profile)
         console.print(checklist)
 
-        # Quarterly plan
+        # Quarterly plan (uses prior_year_tax collected in Step 8)
         if self.result:
-            prior_tax = questionary.text(
-                "Prior year total tax (for estimated payments):",
-                default="30000",
-            ).ask()
-            try:
-                prior_val = float(prior_tax.replace(",", "").replace("$", ""))
-            except (ValueError, AttributeError):
-                prior_val = 30_000.0
+            prior_val = self.profile.prior_year_tax
+            if prior_val == 0.0:
+                console.print("[yellow]Note: Prior year tax is $0 — safe harbor "
+                              "calculation may not be accurate.[/yellow]")
 
             est = estimate_quarterly_payments(
                 self.result.total_tax, prior_val, self.result.agi,

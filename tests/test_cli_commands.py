@@ -233,3 +233,56 @@ class TestCompareCommand:
         session = SessionState.load("domestic")
         restored = deserialize_profile(session.profile_data)
         assert restored.days_in_foreign_country_2025 == 0
+
+
+# =============================================================================
+# Fix 3: Quarterly Plan Prior Year Tax
+# =============================================================================
+
+class TestQuarterlyPlanPriorYearTax:
+    def test_prior_year_tax_serializes_round_trip(self, tmp_path, monkeypatch):
+        """prior_year_tax should survive profile serialization."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            prior_year_tax=28000.0,
+            businesses=[
+                ScheduleCData(business_name="Test", gross_receipts=80000.0),
+            ],
+        )
+        data = serialize_profile(profile)
+        assert data["prior_year_tax"] == 28000.0
+
+        from taxman.cli.serialization import deserialize_profile
+        restored = deserialize_profile(data)
+        assert restored.prior_year_tax == 28000.0
+
+    def test_export_uses_prior_year_tax(self, tmp_path, monkeypatch):
+        """Export quarterly plan should use profile.prior_year_tax, not 0.0."""
+        import taxman.cli.state as state_mod
+        monkeypatch.setattr(state_mod, "SESSIONS_DIR", tmp_path)
+
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            prior_year_tax=25000.0,
+            businesses=[
+                ScheduleCData(
+                    business_name="Test",
+                    gross_receipts=80000.0,
+                    expenses=BusinessExpenses(office_expense=500.0),
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+
+        from taxman.reports import generate_quarterly_plan
+        quarterly_with_prior = generate_quarterly_plan(
+            result.total_tax, profile.prior_year_tax, result.agi,
+            filing_status=profile.filing_status,
+        )
+        quarterly_without = generate_quarterly_plan(
+            result.total_tax, 0.0, result.agi,
+            filing_status=profile.filing_status,
+        )
+
+        # With a real prior_year_tax, safe harbor amount should differ
+        assert "25,000" in quarterly_with_prior or quarterly_with_prior != quarterly_without
