@@ -103,6 +103,36 @@ class TestMFSExpatReturn:
         assert "QUARTERLY" in plan
         assert "Q1 due" in plan
 
+    def test_quarterly_plan_uses_correct_threshold_per_status(self):
+        """Regression: threshold display must match filing status, not hardcode MFS."""
+        # Single filer with AGI above $150K → should show 110%
+        plan_single = generate_quarterly_plan(
+            40_000, 35_000, 200_000,
+            filing_status=FilingStatus.SINGLE,
+        )
+        assert "110%" in plan_single
+
+        # MFS filer with AGI of $80K — above MFS $75K → should show 110%
+        plan_mfs = generate_quarterly_plan(
+            40_000, 35_000, 80_000,
+            filing_status=FilingStatus.MFS,
+        )
+        assert "110%" in plan_mfs
+
+        # MFS filer with AGI of $70K — below MFS $75K → should show 100%
+        plan_mfs_low = generate_quarterly_plan(
+            40_000, 35_000, 70_000,
+            filing_status=FilingStatus.MFS,
+        )
+        assert "100%" in plan_mfs_low
+
+        # Single filer with AGI of $100K — below $150K → should show 100%
+        plan_single_low = generate_quarterly_plan(
+            40_000, 35_000, 100_000,
+            filing_status=FilingStatus.SINGLE,
+        )
+        assert "100%" in plan_single_low
+
 
 class TestSingleFreelancerReturn:
     def test_complete_return(self, single_freelancer):

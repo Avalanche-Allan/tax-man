@@ -5,6 +5,7 @@ and filing checklists from calculated tax data.
 """
 
 from taxman.calculator import (
+    ESTIMATED_TAX_HIGH_INCOME_THRESHOLDS,
     Form1040Result,
     estimate_quarterly_payments,
 )
@@ -321,7 +322,9 @@ def generate_quarterly_plan(total_tax: float, prior_year_tax: float,
         total_tax, prior_year_tax, agi, filing_status=filing_status
     )
 
-    threshold = ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS
+    threshold = ESTIMATED_TAX_HIGH_INCOME_THRESHOLDS.get(
+        filing_status, ESTIMATED_TAX_HIGH_INCOME_THRESHOLD_MFS
+    )
 
     return f"""
 2026 ESTIMATED TAX PAYMENT PLAN

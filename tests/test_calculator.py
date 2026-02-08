@@ -1248,6 +1248,74 @@ class TestK1OrphanedBoxes:
 
 
 # =============================================================================
+# TestK1CapitalGainsRegression (P0 fix — no double subtraction)
+# =============================================================================
+
+class TestK1CapitalGainsRegression:
+    """Regression: K-1 capital gains must not be subtracted from Schedule 1
+    income twice. Before fix, a K-1 with $10K LTCG produced total_income = 0."""
+
+    def test_k1_ltcg_only_not_zeroed(self):
+        """Single K-1 with LTCG should have total_income == capital gain."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="Cap LP",
+                    net_long_term_capital_gain=10_000,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.total_income == 10_000
+        assert result.capital_gain_loss == 10_000
+
+    def test_k1_ltcg_plus_ordinary_income(self):
+        """K-1 LTCG + ordinary income should both appear in total_income."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="Mixed LP",
+                    ordinary_business_income=50_000,
+                    net_long_term_capital_gain=10_000,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        # Ordinary flows to Schedule 1, LTCG flows to Schedule D / Line 7
+        assert result.total_income == 60_000
+
+    def test_k1_stcg_not_double_subtracted(self):
+        """K-1 STCG should also not be double-subtracted."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="Trading LP",
+                    net_short_term_capital_gain=15_000,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.total_income == 15_000
+
+    def test_k1_section_1231_not_double_subtracted(self):
+        """K-1 §1231 gain (treated as LTCG) should not be double-subtracted."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="Equipment LP",
+                    net_section_1231_gain=20_000,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.total_income == 20_000
+
+
+# =============================================================================
 # TestTaxCredits
 # =============================================================================
 

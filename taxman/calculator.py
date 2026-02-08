@@ -1203,7 +1203,7 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
         k1_other_income = sch_e.total_schedule_e_income
         # Subtract pieces that flow to Lines 2b/3b/7 instead of Schedule 1
         k1_other_income -= sch_e.interest_income
-        k1_other_income -= sch_e.capital_gains
+        # Note: capital_gains subtracted below only when Schedule D is computed
 
     # ─── INVESTMENT INCOME (Lines 2-7) ────────────────────────
     # Line 2a: Tax-exempt interest (informational)
