@@ -37,6 +37,18 @@ SINGLE_BRACKETS = [
     (float('inf'), 0.37),
 ]
 
+# Head of Household brackets (2025)
+# Source: Rev. Proc. 2024-40, §3.01 — HOH has its own bracket thresholds
+HOH_BRACKETS = [
+    (17_000, 0.10),
+    (64_850, 0.12),
+    (103_350, 0.22),
+    (197_300, 0.24),
+    (250_500, 0.32),
+    (626_350, 0.35),
+    (float('inf'), 0.37),
+]
+
 MFJ_BRACKETS = [
     (23_850, 0.10),
     (96_950, 0.12),

@@ -85,6 +85,11 @@ class ScheduleK1:
     section_179_deduction: float = 0.0  # Box 12
     other_deductions: float = 0.0  # Box 13
     self_employment_earnings: float = 0.0  # Box 14
+    # QBI info (Box 20, Code Z — reported on Statement A)
+    qbi_amount: float = 0.0  # Partner's share of QBI
+    qbi_w2_wages: float = 0.0  # Partner's share of W-2 wages for QBI
+    qbi_ubia: float = 0.0  # Partner's share of UBIA
+    is_sstb: bool = False  # Specified service trade or business
     tax_year: int = 2025
 
     def __post_init__(self):
@@ -388,6 +393,7 @@ class TaxpayerProfile:
     treat_spouse_as_resident: bool = False
 
     # Income documents
+    forms_w2: list[FormW2] = field(default_factory=list)
     forms_1099_nec: list[Form1099NEC] = field(default_factory=list)
     schedule_k1s: list[ScheduleK1] = field(default_factory=list)
 

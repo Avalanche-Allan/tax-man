@@ -20,6 +20,7 @@ from taxman.constants import (
     ADDITIONAL_MEDICARE_THRESHOLD_MFS,
     ADDITIONAL_MEDICARE_THRESHOLD_SINGLE,
     ADDITIONAL_MEDICARE_THRESHOLD_MFJ,
+    HOH_BRACKETS,
     MFS_BRACKETS,
     MFJ_BRACKETS,
     SINGLE_BRACKETS,
@@ -33,6 +34,7 @@ from taxman.constants import (
 from taxman.models import (
     BusinessExpenses,
     FilingStatus,
+    FormW2,
     HomeOffice,
     ScheduleCData,
     ScheduleK1,
@@ -135,17 +137,18 @@ class TestCalculateScheduleC:
         assert abs(result.total_expenses - 3960) < 0.01
 
     def test_cogs(self):
-        """Note: calculator's gross_income doesn't subtract COGS.
-        COGS subtraction is handled in the model's gross_profit property.
-        The calculator uses gross_income = gross_receipts - returns."""
+        """COGS is subtracted to get gross profit (Line 5), which feeds
+        into gross income (Line 7 = gross profit + other income)."""
         biz = ScheduleCData(
             business_name="COGS Biz",
             gross_receipts=100_000,
             cost_of_goods_sold=30_000,
         )
         result = calculate_schedule_c(biz)
-        assert result.gross_income == 100_000  # gross receipts minus returns (0)
-        assert result.net_profit_loss == 100_000  # calculator doesn't subtract COGS
+        assert result.cost_of_goods_sold == 30_000
+        assert result.gross_profit == 70_000  # 100K - 30K COGS
+        assert result.gross_income == 70_000  # gross profit + 0 other income
+        assert result.net_profit_loss == 70_000  # gross income - 0 expenses
 
     def test_returns_and_allowances(self):
         biz = ScheduleCData(
@@ -154,7 +157,36 @@ class TestCalculateScheduleC:
             returns_and_allowances=5_000,
         )
         result = calculate_schedule_c(biz)
+        assert result.gross_profit == 95_000  # 100K - 5K returns - 0 COGS
         assert result.gross_income == 95_000
+
+    def test_other_income(self):
+        """Other income (Line 6) is added to gross profit to get gross income."""
+        biz = ScheduleCData(
+            business_name="Other Income Biz",
+            gross_receipts=80_000,
+            other_income=5_000,
+        )
+        result = calculate_schedule_c(biz)
+        assert result.gross_profit == 80_000
+        assert result.other_income == 5_000
+        assert result.gross_income == 85_000  # gross profit + other income
+        assert result.net_profit_loss == 85_000
+
+    def test_cogs_with_returns_and_other_income(self):
+        """Full Schedule C income flow: receipts - returns - COGS + other."""
+        biz = ScheduleCData(
+            business_name="Full Flow Biz",
+            gross_receipts=200_000,
+            returns_and_allowances=10_000,
+            cost_of_goods_sold=50_000,
+            other_income=3_000,
+            expenses=BusinessExpenses(supplies=5_000),
+        )
+        result = calculate_schedule_c(biz)
+        assert result.gross_profit == 140_000  # 200K - 10K - 50K
+        assert result.gross_income == 143_000  # 140K + 3K
+        assert result.net_profit_loss == 138_000  # 143K - 5K expenses
 
 
 # =============================================================================
@@ -395,6 +427,22 @@ class TestCalculateIncomeTax:
         tax_mfs = calculate_income_tax(200_000, MFS_BRACKETS)
         assert tax_mfj < tax_mfs
 
+    def test_hoh_lower_than_single(self):
+        """HOH has wider 10% and 12% brackets than Single."""
+        tax_hoh = calculate_income_tax(50_000, HOH_BRACKETS)
+        tax_single = calculate_income_tax(50_000, SINGLE_BRACKETS)
+        assert tax_hoh < tax_single
+
+    def test_hoh_10_pct_bracket(self):
+        """HOH 10% bracket goes up to $17,000 (vs $11,925 for Single)."""
+        tax = calculate_income_tax(17_000, HOH_BRACKETS)
+        assert tax == 1_700.0  # 17K * 10%
+
+    def test_hoh_bracket_lookup(self):
+        """BRACKETS_BY_STATUS maps HOH to HOH_BRACKETS, not Single."""
+        brackets = BRACKETS_BY_STATUS[FilingStatus.HOH]
+        assert brackets is HOH_BRACKETS
+
 
 # =============================================================================
 # TestCalculateAdditionalMedicare
@@ -541,6 +589,159 @@ class TestEstimateQuarterlyPayments:
         assert est_mfs["safe_harbor_prior_year"] == 38_500.0
         # Single threshold = 150K (AGI 100K < 150K → 100%)
         assert est_single["safe_harbor_prior_year"] == 35_000.0
+
+
+# =============================================================================
+# TestW2Integration
+# =============================================================================
+
+class TestW2Integration:
+    def test_wage_income_flows_to_total(self):
+        """W-2 wages should appear in total income."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_w2=[
+                FormW2(wages=75_000, federal_tax_withheld=10_000,
+                       ss_wages=75_000, medicare_wages=75_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.wage_income == 75_000
+        assert result.total_income == 75_000
+
+    def test_withholding_flows_to_payments(self):
+        """W-2 federal withholding should be included in total payments."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_w2=[
+                FormW2(wages=75_000, federal_tax_withheld=10_000,
+                       ss_wages=75_000, medicare_wages=75_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.withholding == 10_000
+        assert result.total_payments == 10_000
+
+    def test_w2_plus_schedule_c(self):
+        """W-2 wages + Schedule C income both flow into total income."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_w2=[
+                FormW2(wages=60_000, federal_tax_withheld=8_000,
+                       ss_wages=60_000, medicare_wages=60_000),
+            ],
+            businesses=[
+                ScheduleCData(
+                    business_name="Side Gig",
+                    gross_receipts=30_000,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.wage_income == 60_000
+        assert result.total_income == 90_000  # 60K wages + 30K biz
+
+    def test_ss_wage_base_coordination(self):
+        """W-2 SS wages reduce remaining SS base for SE tax."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_w2=[
+                FormW2(wages=150_000, federal_tax_withheld=20_000,
+                       ss_wages=150_000, medicare_wages=150_000),
+            ],
+            businesses=[
+                ScheduleCData(
+                    business_name="Side Gig",
+                    gross_receipts=50_000,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        # SS wage base = $176,100. W-2 used $150K, leaving $26,100 for SE.
+        # SE taxable = 50K * 0.9235 = 46,175
+        # SS portion: min(46_175, 26_100) * 12.4% = 26_100 * 0.124 = 3,236.40
+        # Medicare: 46_175 * 2.9% = 1,339.08
+        # Total SE = 4,575.48
+        assert result.schedule_se is not None
+        assert result.se_tax < 7_065  # Would be ~7,065 without coordination
+
+    def test_multiple_w2s(self):
+        """Multiple W-2s should be summed."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_w2=[
+                FormW2(wages=40_000, federal_tax_withheld=5_000,
+                       ss_wages=40_000, medicare_wages=40_000),
+                FormW2(wages=35_000, federal_tax_withheld=4_500,
+                       ss_wages=35_000, medicare_wages=35_000),
+            ],
+        )
+        result = calculate_return(profile)
+        assert result.wage_income == 75_000
+        assert result.withholding == 9_500
+
+
+# =============================================================================
+# TestK1QBI
+# =============================================================================
+
+class TestK1QBI:
+    def test_k1_qbi_included(self):
+        """K-1 QBI from non-SSTB partnerships should be included in QBI deduction."""
+        from taxman.calculator import ScheduleCResult
+        sc = ScheduleCResult(business_name="Test", net_profit_loss=50_000)
+        result = calculate_qbi_deduction(
+            80_000, [sc], FilingStatus.SINGLE, k1_qbi=30_000,
+        )
+        # Total QBI = 50K + 30K = 80K, deduction = 20% of 80K = 16K
+        assert result.total_qbi == 80_000
+        assert result.qbi_deduction == 16_000
+
+    def test_sstb_k1_excluded(self):
+        """K-1 from SSTB partnerships should NOT contribute QBI."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[
+                ScheduleCData(
+                    business_name="Main Biz",
+                    gross_receipts=50_000,
+                ),
+            ],
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="SSTB Partnership",
+                    ordinary_business_income=30_000,
+                    qbi_amount=30_000,
+                    is_sstb=True,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        # SSTB K-1 QBI should be excluded
+        assert result.qbi.total_qbi == 50_000  # Only Schedule C
+
+    def test_k1_qbi_in_full_return(self):
+        """K-1 QBI flows through calculate_return correctly."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[
+                ScheduleCData(
+                    business_name="Main Biz",
+                    gross_receipts=50_000,
+                ),
+            ],
+            schedule_k1s=[
+                ScheduleK1(
+                    partnership_name="Non-SSTB Partnership",
+                    ordinary_business_income=30_000,
+                    qbi_amount=30_000,
+                    is_sstb=False,
+                ),
+            ],
+        )
+        result = calculate_return(profile)
+        # Total QBI should include both Schedule C and K-1
+        assert result.qbi.total_qbi == 80_000  # 50K + 30K
 
 
 # =============================================================================

@@ -23,6 +23,7 @@ from taxman.constants import (
     MFS_BRACKETS,
     MFJ_BRACKETS,
     SINGLE_BRACKETS,
+    HOH_BRACKETS,
     NIIT_RATE,
     NIIT_THRESHOLD_MFS,
     NIIT_THRESHOLD_SINGLE,
@@ -52,7 +53,7 @@ BRACKETS_BY_STATUS = {
     FilingStatus.SINGLE: SINGLE_BRACKETS,
     FilingStatus.MFJ: MFJ_BRACKETS,
     FilingStatus.MFS: MFS_BRACKETS,
-    FilingStatus.HOH: SINGLE_BRACKETS,  # HOH uses own brackets but close to Single
+    FilingStatus.HOH: HOH_BRACKETS,
     FilingStatus.QSS: MFJ_BRACKETS,
 }
 
@@ -112,6 +113,9 @@ class ScheduleCResult:
     business_name: str
     gross_receipts: float = 0.0       # Line 1
     returns_allowances: float = 0.0    # Line 2
+    cost_of_goods_sold: float = 0.0    # Line 4
+    gross_profit: float = 0.0          # Line 5
+    other_income: float = 0.0          # Line 6
     gross_income: float = 0.0          # Line 7
     total_expenses: float = 0.0        # Line 28
     net_profit_loss: float = 0.0       # Line 31
@@ -166,6 +170,7 @@ class Form2555Result:
 class Form1040Result:
     """Complete calculated Form 1040."""
     # Income
+    wage_income: float = 0.0           # Line 1a (W-2 wages)
     total_income: float = 0.0          # Line 9
     adjustments: float = 0.0           # Line 10
     agi: float = 0.0                   # Line 11
@@ -181,6 +186,7 @@ class Form1040Result:
     # Payments
     total_payments: float = 0.0        # Line 33
     estimated_payments: float = 0.0
+    withholding: float = 0.0           # Line 25a (W-2 federal withholding)
     # Result
     overpayment: float = 0.0          # Line 34
     amount_owed: float = 0.0          # Line 37
@@ -206,6 +212,9 @@ def calculate_schedule_c(biz: ScheduleCData) -> ScheduleCResult:
     lines = []
 
     # Part I: Income
+    # IRS Schedule C flow: Line 1 (gross receipts) - Line 2 (returns)
+    # = Line 3 (net receipts) - Line 4 (COGS) = Line 5 (gross profit)
+    # + Line 6 (other income) = Line 7 (gross income)
     result.gross_receipts = biz.gross_receipts
     lines.append(LineItem("Schedule C", "1", "Gross receipts or sales",
                           biz.gross_receipts))
@@ -214,11 +223,27 @@ def calculate_schedule_c(biz: ScheduleCData) -> ScheduleCResult:
     lines.append(LineItem("Schedule C", "2", "Returns and allowances",
                           biz.returns_and_allowances))
 
-    gross_income = biz.gross_income
+    result.cost_of_goods_sold = biz.cost_of_goods_sold
+    if biz.cost_of_goods_sold > 0:
+        lines.append(LineItem("Schedule C", "4", "Cost of goods sold",
+                              biz.cost_of_goods_sold))
+
+    gross_profit = biz.gross_profit  # receipts - returns - COGS
+    result.gross_profit = gross_profit
+    lines.append(LineItem("Schedule C", "5", "Gross profit",
+                          gross_profit,
+                          "Line 1 minus Line 2 minus Line 4"))
+
+    result.other_income = biz.other_income
+    if biz.other_income > 0:
+        lines.append(LineItem("Schedule C", "6", "Other income",
+                              biz.other_income))
+
+    gross_income = gross_profit + biz.other_income
     result.gross_income = gross_income
     lines.append(LineItem("Schedule C", "7", "Gross income",
                           gross_income,
-                          "Line 1 minus Line 2 minus COGS"))
+                          "Line 5 plus Line 6"))
 
     # Part II: Expenses
     exp = biz.expenses
@@ -283,14 +308,17 @@ def calculate_schedule_c(biz: ScheduleCData) -> ScheduleCResult:
     return result
 
 
-def calculate_schedule_se(net_se_income: float) -> ScheduleSEResult:
+def calculate_schedule_se(
+    net_se_income: float, w2_ss_wages: float = 0.0
+) -> ScheduleSEResult:
     """Calculate Schedule SE (Self-Employment Tax).
 
     IRS Instructions: https://www.irs.gov/instructions/i1040sse
 
     SE tax applies to net self-employment earnings of $400 or more.
     Rate is 15.3% (12.4% Social Security + 2.9% Medicare).
-    Social Security portion caps at the wage base ($176,100 for 2025).
+    Social Security portion caps at the wage base ($176,100 for 2025),
+    reduced by any W-2 SS wages already subject to SS tax.
     """
     result = ScheduleSEResult()
     lines = []
@@ -315,7 +343,9 @@ def calculate_schedule_se(net_se_income: float) -> ScheduleSEResult:
                           f"${net_se_income:,.2f} × 0.9235 = ${taxable_se:,.2f}"))
 
     # Calculate SS and Medicare portions separately
-    ss_earnings = min(taxable_se, SS_WAGE_BASE)
+    # SS wage base is reduced by W-2 SS wages (Line 8a-8b on Schedule SE)
+    remaining_ss_base = max(SS_WAGE_BASE - w2_ss_wages, 0)
+    ss_earnings = min(taxable_se, remaining_ss_base)
     ss_tax = round(ss_earnings * SS_TAX_RATE, 2)
     medicare_tax = round(taxable_se * MEDICARE_TAX_RATE, 2)
     se_tax = round(ss_tax + medicare_tax, 2)
@@ -441,6 +471,9 @@ def calculate_qbi_deduction(
     filing_status: FilingStatus = FilingStatus.MFS,
     w2_wages: float = 0.0,
     ubia: float = 0.0,
+    k1_qbi: float = 0.0,
+    k1_w2_wages: float = 0.0,
+    k1_ubia: float = 0.0,
 ) -> Form8995Result:
     """Calculate QBI deduction (Form 8995/8995-A).
 
@@ -449,16 +482,25 @@ def calculate_qbi_deduction(
     For MFS, the threshold where limitations begin is $197,300 (2025).
     Below threshold: simple 20% of QBI (Form 8995).
     Above threshold: W-2 wage / capital limitations apply (Form 8995-A).
+
+    QBI sources: Schedule C net profit + K-1 Box 20 Code Z (non-SSTB).
     """
     result = Form8995Result()
     lines = []
 
-    total_qbi = sum(r.net_profit_loss for r in schedule_c_results)
+    schedule_c_qbi = sum(r.net_profit_loss for r in schedule_c_results)
+    total_qbi = schedule_c_qbi + k1_qbi
+    total_w2_wages = w2_wages + k1_w2_wages
+    total_ubia = ubia + k1_ubia
     result.total_qbi = total_qbi
+
+    qbi_source = "Schedule C businesses"
+    if k1_qbi > 0:
+        qbi_source += f" + K-1 QBI (${k1_qbi:,.2f})"
     lines.append(LineItem("Form 8995", "1-3",
                           "Total qualified business income",
                           round(total_qbi, 2),
-                          "Sum of net profit from all Schedule C businesses"))
+                          f"Sum of net profit from {qbi_source}"))
 
     if total_qbi <= 0:
         lines.append(LineItem("Form 8995", "—",
@@ -494,7 +536,11 @@ def calculate_qbi_deduction(
 
         # W-2/UBIA limitation: greater of (50% of W-2 wages) or
         # (25% of W-2 wages + 2.5% of UBIA)
-        wage_limit = max(w2_wages * 0.50, w2_wages * 0.25 + ubia * 0.025)
+        # Uses combined W-2 wages and UBIA from all QBI sources
+        wage_limit = max(
+            total_w2_wages * 0.50,
+            total_w2_wages * 0.25 + total_ubia * 0.025,
+        )
         limited_amount = min(total_qbi * QBI_DEDUCTION_RATE, wage_limit)
         full_amount = total_qbi * QBI_DEDUCTION_RATE
         qbi_deduction = full_amount - (full_amount - limited_amount) * phase_out_pct
@@ -507,8 +553,8 @@ def calculate_qbi_deduction(
                               f"${taxable_income_before_qbi:,.2f} exceeds "
                               f"${threshold:,} by ${excess:,.2f}. "
                               f"Phase-out: {phase_out_pct:.1%}. "
-                              f"W-2 wages: ${w2_wages:,.2f}, "
-                              f"UBIA: ${ubia:,.2f}, "
+                              f"W-2 wages: ${total_w2_wages:,.2f}, "
+                              f"UBIA: ${total_ubia:,.2f}, "
                               f"Wage limit: ${wage_limit:,.2f}."))
 
     result.lines = lines
@@ -692,13 +738,20 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
     # ─── SCHEDULE SE ───────────────────────────────────────────
     # SE income = Schedule C profits + K-1 SE earnings
     total_se_income = total_business_income + k1_se_income
+    # W-2 SS wages reduce the remaining SS wage base for SE tax
+    w2_ss_wages = sum(w2.ss_wages for w2 in profile.forms_w2)
     if total_se_income >= SE_MINIMUM_INCOME:
-        se = calculate_schedule_se(total_se_income)
+        se = calculate_schedule_se(total_se_income, w2_ss_wages=w2_ss_wages)
         result.schedule_se = se
         result.se_tax = se.se_tax
 
     # ─── FORM 1040: INCOME ─────────────────────────────────────
-    wages = 0.0
+    # W-2 wage income (Line 1a)
+    wages = sum(w2.wages for w2 in profile.forms_w2)
+    result.wage_income = round(wages, 2)
+    if wages > 0:
+        lines.append(LineItem("Form 1040", "1a", "Wages, salaries, tips",
+                              result.wage_income))
 
     # Schedule 1 income: business + K-1
     schedule_1_income = total_business_income + k1_other_income
@@ -758,9 +811,15 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                           result.deduction))
 
     # ─── QBI DEDUCTION ─────────────────────────────────────────
+    # Aggregate K-1 QBI (non-SSTB partnerships only)
+    k1_qbi = sum(k1.qbi_amount for k1 in profile.schedule_k1s if not k1.is_sstb)
+    k1_w2_wages = sum(k1.qbi_w2_wages for k1 in profile.schedule_k1s if not k1.is_sstb)
+    k1_ubia = sum(k1.qbi_ubia for k1 in profile.schedule_k1s if not k1.is_sstb)
+
     taxable_before_qbi = max(result.agi - result.deduction, 0)
     qbi_result = calculate_qbi_deduction(
-        taxable_before_qbi, result.schedule_c_results, fs
+        taxable_before_qbi, result.schedule_c_results, fs,
+        k1_qbi=k1_qbi, k1_w2_wages=k1_w2_wages, k1_ubia=k1_ubia,
     )
     result.qbi = qbi_result
     result.qbi_deduction = qbi_result.qbi_deduction
@@ -783,15 +842,23 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                           f"From {fs.value.upper()} tax brackets"))
 
     # Additional Medicare Tax (Form 8959)
-    if result.schedule_se:
+    # Per Form 8959: applies to combined W-2 Medicare wages + SE earnings
+    # exceeding the filing-status threshold
+    w2_medicare_wages = sum(w2.medicare_wages for w2 in profile.forms_w2)
+    se_medicare_earnings = (
+        result.schedule_se.taxable_se_earnings if result.schedule_se else 0.0
+    )
+    combined_medicare_earnings = w2_medicare_wages + se_medicare_earnings
+    if combined_medicare_earnings > 0:
         result.additional_medicare = calculate_additional_medicare(
-            result.schedule_se.taxable_se_earnings, fs
+            combined_medicare_earnings, fs
         )
         if result.additional_medicare > 0:
             lines.append(LineItem("Schedule 2", "23",
                                   "Additional Medicare Tax (0.9%)",
                                   result.additional_medicare,
-                                  f"SE earnings ${result.schedule_se.taxable_se_earnings:,.2f} "
+                                  f"Combined Medicare earnings "
+                                  f"${combined_medicare_earnings:,.2f} "
                                   f"exceeds {fs.value.upper()} threshold"))
 
     # Net Investment Income Tax (Form 8960)
@@ -815,11 +882,24 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                           + (f" + NIIT ${result.niit:,.2f}" if result.niit else "")))
 
     # ─── PAYMENTS ──────────────────────────────────────────────
+    # W-2 federal income tax withheld (Line 25a)
+    result.withholding = round(
+        sum(w2.federal_tax_withheld for w2 in profile.forms_w2), 2
+    )
+    if result.withholding > 0:
+        lines.append(LineItem("Form 1040", "25a",
+                              "Federal income tax withheld (W-2)",
+                              result.withholding))
+
     result.estimated_payments = profile.total_estimated_payments
-    result.total_payments = result.estimated_payments
-    lines.append(LineItem("Form 1040", "26",
-                          "Estimated tax payments",
-                          result.estimated_payments))
+    if result.estimated_payments > 0:
+        lines.append(LineItem("Form 1040", "26",
+                              "Estimated tax payments",
+                              result.estimated_payments))
+
+    result.total_payments = round(
+        result.withholding + result.estimated_payments, 2
+    )
     lines.append(LineItem("Form 1040", "33", "Total payments",
                           result.total_payments))
 
