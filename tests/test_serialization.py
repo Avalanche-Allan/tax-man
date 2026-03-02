@@ -23,10 +23,12 @@ from taxman.models import (
     Form1099DIV,
     Form1099INT,
     Form1099NEC,
+    Form1099R,
     FormW2,
     HealthInsurance,
     HomeOffice,
     ScheduleCData,
+    ScheduleEProperty,
     ScheduleK1,
     TaxpayerProfile,
 )
@@ -429,3 +431,111 @@ class TestSchemaVersioning:
         session = SessionState.create()
         assert hasattr(session, "profile_data")
         assert session.profile_data == {}
+
+
+# =============================================================================
+# Form1099R, ScheduleEProperty, NOL Round-Trip Tests
+# =============================================================================
+
+class TestNewModelSerialization:
+    def test_form_1099r_round_trip(self):
+        """1099-R data survives serialization round-trip."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_r=[
+                Form1099R(
+                    payer_name="Fidelity",
+                    gross_distribution=103.95,
+                    taxable_amount=103.95,
+                    federal_tax_withheld=10.0,
+                    distribution_code="1",
+                    is_early_distribution=True,
+                ),
+            ],
+        )
+        data = serialize_profile(profile)
+        restored = deserialize_profile(data)
+
+        assert len(restored.forms_1099_r) == 1
+        r = restored.forms_1099_r[0]
+        assert r.payer_name == "Fidelity"
+        assert r.gross_distribution == 103.95
+        assert r.taxable_amount == 103.95
+        assert r.federal_tax_withheld == 10.0
+        assert r.distribution_code == "1"
+        assert r.is_early_distribution is True
+
+    def test_schedule_e_property_round_trip(self):
+        """Schedule E rental property data survives serialization round-trip."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            schedule_e_properties=[
+                ScheduleEProperty(
+                    property_address="123 Main St, Denver CO",
+                    property_type="single_family",
+                    ownership_pct=50.0,
+                    gross_rents=12000.0,
+                    mortgage_interest=3000.0,
+                    taxes=1500.0,
+                    insurance=800.0,
+                    depreciation=2000.0,
+                    repairs=500.0,
+                ),
+            ],
+        )
+        data = serialize_profile(profile)
+        restored = deserialize_profile(data)
+
+        assert len(restored.schedule_e_properties) == 1
+        p = restored.schedule_e_properties[0]
+        assert p.property_address == "123 Main St, Denver CO"
+        assert p.ownership_pct == 50.0
+        assert p.gross_rents == 12000.0
+        assert p.mortgage_interest == 3000.0
+        assert p.depreciation == 2000.0
+        assert p.net_income == 12000.0 - (3000 + 1500 + 800 + 2000 + 500)
+
+    def test_nol_carryforward_round_trip(self):
+        """NOL carryforward field survives serialization round-trip."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            nol_carryforward=20989.0,
+        )
+        data = serialize_profile(profile)
+        restored = deserialize_profile(data)
+        assert restored.nol_carryforward == 20989.0
+
+    def test_nol_default_zero(self):
+        """NOL defaults to zero for new profiles."""
+        profile = TaxpayerProfile()
+        data = serialize_profile(profile)
+        restored = deserialize_profile(data)
+        assert restored.nol_carryforward == 0.0
+
+    def test_empty_1099r_and_properties(self):
+        """Empty lists for new model types work correctly."""
+        profile = TaxpayerProfile()
+        data = serialize_profile(profile)
+        restored = deserialize_profile(data)
+        assert restored.forms_1099_r == []
+        assert restored.schedule_e_properties == []
+
+    def test_result_round_trip_with_1099r(self):
+        """Calculate with 1099-R, serialize result, verify fields survive."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_r=[Form1099R(
+                payer_name="Fidelity",
+                gross_distribution=1000.0,
+                taxable_amount=1000.0,
+                distribution_code="1",
+                is_early_distribution=True,
+            )],
+        )
+        result = calculate_return(profile)
+        data = serialize_result(result)
+        restored = deserialize_result(data)
+
+        assert restored.ira_distributions == result.ira_distributions
+        assert restored.early_withdrawal_penalty == result.early_withdrawal_penalty
+        assert restored.total_tax == result.total_tax

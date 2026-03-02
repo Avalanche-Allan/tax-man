@@ -44,9 +44,11 @@ from taxman.models import (
     Form1099DIV,
     Form1099INT,
     Form1099NEC,
+    Form1099R,
     FormW2,
     HomeOffice,
     ScheduleCData,
+    ScheduleEProperty,
     ScheduleK1,
     TaxpayerProfile,
 )
@@ -1735,3 +1737,364 @@ class TestFEIEIntegration:
         )
         scenarios = compare_feie_scenarios(profile)
         assert isinstance(scenarios["feie_result"], Form2555Result)
+
+
+# =============================================================================
+# TestNOLCarryforward
+# =============================================================================
+
+class TestNOLCarryforward:
+    def test_nol_reduces_agi(self):
+        """NOL carryforward reduces AGI via Schedule 1."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            businesses=[ScheduleCData(
+                business_name="Consulting",
+                gross_receipts=100_000,
+            )],
+            nol_carryforward=20_000,
+        )
+        result = calculate_return(profile)
+        # Without NOL, total_income would include 100K business income
+        # With NOL, schedule_1_income = 100K - 20K = 80K
+        assert result.total_income == 80_000
+
+    def test_nol_zero_has_no_effect(self):
+        """Zero NOL should not affect calculation."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            businesses=[ScheduleCData(
+                business_name="Freelance",
+                gross_receipts=50_000,
+            )],
+            nol_carryforward=0,
+        )
+        result = calculate_return(profile)
+        assert result.total_income == 50_000
+
+    def test_nol_line_item_present(self):
+        """NOL should create a Schedule 1 Line 8a entry."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            businesses=[ScheduleCData(
+                business_name="Consulting",
+                gross_receipts=100_000,
+            )],
+            nol_carryforward=15_000,
+        )
+        result = calculate_return(profile)
+        nol_lines = [l for l in result.lines if l.line == "8a" and "operating loss" in l.description.lower()]
+        assert len(nol_lines) == 1
+        assert nol_lines[0].amount == -15_000
+
+    def test_nol_can_create_negative_schedule_1(self):
+        """NOL larger than business income creates negative Schedule 1 income."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            businesses=[ScheduleCData(
+                business_name="Small Biz",
+                gross_receipts=10_000,
+            )],
+            nol_carryforward=25_000,
+        )
+        result = calculate_return(profile)
+        assert result.total_income == -15_000
+
+
+# =============================================================================
+# TestForm1099R
+# =============================================================================
+
+class TestForm1099R:
+    def test_taxable_distribution_flows_to_income(self):
+        """1099-R taxable amount should appear in total income."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_r=[Form1099R(
+                payer_name="Fidelity",
+                gross_distribution=103.95,
+                taxable_amount=103.95,
+                distribution_code="1",
+                is_early_distribution=True,
+            )],
+        )
+        result = calculate_return(profile)
+        assert result.ira_distributions == 103.95
+        assert result.total_income == pytest.approx(103.95, abs=0.01)
+
+    def test_early_withdrawal_penalty(self):
+        """Early distribution should incur 10% penalty."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_r=[Form1099R(
+                payer_name="Fidelity",
+                gross_distribution=1000.0,
+                taxable_amount=1000.0,
+                distribution_code="1",
+                is_early_distribution=True,
+            )],
+        )
+        result = calculate_return(profile)
+        assert result.early_withdrawal_penalty == 100.0
+
+    def test_no_penalty_for_normal_distribution(self):
+        """Non-early distribution should have no penalty."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_r=[Form1099R(
+                payer_name="Fidelity",
+                gross_distribution=5000.0,
+                taxable_amount=5000.0,
+                distribution_code="7",
+                is_early_distribution=False,
+            )],
+        )
+        result = calculate_return(profile)
+        assert result.early_withdrawal_penalty == 0.0
+        assert result.ira_distributions == 5000.0
+
+    def test_1099r_withholding_counted(self):
+        """1099-R federal withholding should be included in total payments."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_r=[Form1099R(
+                payer_name="Fidelity",
+                gross_distribution=10000.0,
+                taxable_amount=10000.0,
+                federal_tax_withheld=2000.0,
+            )],
+        )
+        result = calculate_return(profile)
+        assert result.withholding == 2000.0
+
+    def test_early_penalty_in_total_tax(self):
+        """Early withdrawal penalty should be included in total tax."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_r=[Form1099R(
+                payer_name="Fidelity",
+                gross_distribution=50000.0,
+                taxable_amount=50000.0,
+                distribution_code="1",
+                is_early_distribution=True,
+            )],
+        )
+        result = calculate_return(profile)
+        # Total tax should include income tax + early penalty (5000)
+        assert result.early_withdrawal_penalty == 5000.0
+        assert result.total_tax >= result.tax + 5000.0
+
+
+# =============================================================================
+# TestScheduleERental
+# =============================================================================
+
+class TestScheduleERental:
+    def test_rental_income_flows_to_schedule_e(self):
+        """Direct rental property income should flow through Schedule E."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="123 Main St",
+                gross_rents=12000.0,
+                mortgage_interest=3000.0,
+                taxes=1500.0,
+                insurance=800.0,
+                depreciation=2000.0,
+                repairs=500.0,
+            )],
+        )
+        result = calculate_return(profile)
+        assert result.schedule_e is not None
+        # Net = 12000 - (3000 + 1500 + 800 + 2000 + 500) = 4200
+        assert result.schedule_e.net_rental_income == pytest.approx(4200.0)
+        assert result.total_income == pytest.approx(4200.0)
+
+    def test_mfs_rental_loss_suspended(self):
+        """MFS filer should have rental losses suspended."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="456 Oak Ave",
+                gross_rents=8000.0,
+                mortgage_interest=5000.0,
+                taxes=2000.0,
+                insurance=1000.0,
+                depreciation=3000.0,
+            )],
+        )
+        result = calculate_return(profile)
+        # Net = 8000 - 11000 = -3000, but MFS suspends losses
+        assert result.schedule_e.net_rental_income == 0.0
+
+    def test_rental_with_k1_combined(self):
+        """Direct rental and K-1 income should combine in Schedule E."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="123 Main St",
+                gross_rents=10000.0,
+                mortgage_interest=2000.0,
+                taxes=1000.0,
+            )],
+            schedule_k1s=[ScheduleK1(
+                partnership_name="ABC Partners",
+                ordinary_business_income=5000.0,
+            )],
+        )
+        result = calculate_return(profile)
+        assert result.schedule_e is not None
+        # Rental net = 10000 - 3000 = 7000
+        assert result.schedule_e.net_rental_income == pytest.approx(7000.0)
+        assert result.schedule_e.ordinary_business_income == 5000.0
+
+    def test_single_filer_rental_loss_allowed(self):
+        """Single filer should be able to deduct rental losses (up to $25K allowance)."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="789 Elm Dr",
+                gross_rents=6000.0,
+                mortgage_interest=4000.0,
+                taxes=2000.0,
+                insurance=1000.0,
+                depreciation=3000.0,
+            )],
+        )
+        result = calculate_return(profile)
+        # Net = 6000 - 10000 = -4000 (within $25K allowance for non-MFS)
+        assert result.schedule_e.net_rental_income == pytest.approx(-4000.0)
+
+    def test_rental_in_niit_calculation(self):
+        """Rental income should be included in net investment income for NIIT."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="100 Rental Rd",
+                gross_rents=300_000.0,
+            )],
+        )
+        result = calculate_return(profile)
+        # AGI well above MFS NIIT threshold, rental income is investment income
+        assert result.niit > 0
+
+
+# =============================================================================
+# TestFEIEDayAllocation
+# =============================================================================
+
+
+class TestFEIEDayAllocation:
+    """Tests for FEIE day-based income allocation (Form 2555 Part IV)."""
+
+    def test_all_foreign_no_us_days(self):
+        """No US business days means all income is foreign."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=340,
+            us_business_days=0,
+            total_work_days=240,
+        )
+        result = evaluate_feie(profile, 80_000, 10_000, 100_000,
+                               gross_receipts=120_000)
+        assert result.foreign_earned_income == 120_000
+        assert result.us_earned_income == 0.0
+
+    def test_us_days_reduce_foreign_earned(self):
+        """US business days reduce the foreign earned income proportionally."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=340,
+            us_business_days=21,
+            total_work_days=240,
+        )
+        result = evaluate_feie(profile, 80_000, 10_000, 100_000,
+                               gross_receipts=120_000)
+        # US earned = 120K * 21/240 = 10,500
+        assert result.us_earned_income == 10_500.0
+        # Foreign earned = 120K - 10,500 = 109,500
+        assert result.foreign_earned_income == 109_500.0
+        # Exclusion should be the foreign earned amount (under limit)
+        assert result.exclusion_amount == 109_500.0
+
+    def test_exclusion_capped_at_limit(self):
+        """Foreign earned above FEIE limit is capped."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=340,
+            us_business_days=5,
+            total_work_days=240,
+        )
+        result = evaluate_feie(profile, 200_000, 40_000, 180_000,
+                               gross_receipts=200_000)
+        # Foreign earned = 200K * 235/240 = 195,833
+        # But capped at FEIE limit ($130,000 for 2025)
+        from taxman.constants import FEIE_EXCLUSION_LIMIT
+        assert result.exclusion_amount == FEIE_EXCLUSION_LIMIT
+
+    def test_allocable_deductions_computed(self):
+        """Allocable deductions (Line 44) reduce the net exclusion."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=340,
+            us_business_days=21,
+            total_work_days=240,
+        )
+        result = evaluate_feie(profile, 50_000, 5_000, 90_000,
+                               gross_receipts=112_000, se_deduction=7_000)
+        # Expenses = 112K - 90K = 22K
+        # Total deductions = 7K (SE) + 22K (expenses) = 29K
+        # Alloc ratio = exclusion / gross
+        # Foreign = 112K * 219/240 = 102,200
+        # Ratio = 102,200 / 112,000 = 0.9125
+        # Allocable = 29K * 0.9125 = 26,462.50
+        assert result.allocable_deductions > 0
+        assert result.net_exclusion < result.exclusion_amount
+        assert result.net_exclusion == round(
+            result.exclusion_amount - result.allocable_deductions, 2)
+
+    def test_compare_feie_passes_gross_receipts(self):
+        """compare_feie_scenarios passes gross_receipts to evaluate_feie."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=340,
+            us_business_days=21,
+            total_work_days=240,
+            businesses=[ScheduleCData(
+                business_name="Consulting",
+                gross_receipts=112_000,
+            )],
+        )
+        scenarios = compare_feie_scenarios(profile)
+        feie = scenarios["feie_result"]
+        assert feie.gross_earned_income == 112_000
+        assert feie.us_earned_income > 0
+        assert feie.foreign_earned_income < 112_000
+
+    def test_feie_realistic_mfs_scenario(self):
+        """Realistic MFS scenario: 21 US biz days, 240 total work days."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=334,
+            days_in_us_2025=31,
+            us_business_days=21,
+            total_work_days=240,
+            businesses=[ScheduleCData(
+                business_name="Test Consulting LLC",
+                gross_receipts=112_115.30,
+                expenses=BusinessExpenses(other_expenses=14_304.64),
+            )],
+        )
+        scenarios = compare_feie_scenarios(profile)
+        feie = scenarios["feie_result"]
+        # US earned ~= 112,115.30 * 21/240 = ~9,810
+        assert 9_500 < feie.us_earned_income < 10_200
+        # Foreign earned ~= 102,305
+        assert 101_500 < feie.foreign_earned_income < 103_000
+        # Exclusion = foreign earned (under $130K limit)
+        assert feie.exclusion_amount == feie.foreign_earned_income
+        # Allocable deductions should be positive
+        assert feie.allocable_deductions > 0
+        # Net exclusion = exclusion - allocable deductions
+        assert feie.net_exclusion == round(
+            feie.exclusion_amount - feie.allocable_deductions, 2)

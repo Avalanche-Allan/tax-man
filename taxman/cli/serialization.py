@@ -22,10 +22,12 @@ from taxman.models import (
     Form1099DIV,
     Form1099INT,
     Form1099NEC,
+    Form1099R,
     FormW2,
     HealthInsurance,
     HomeOffice,
     ScheduleCData,
+    ScheduleEProperty,
     ScheduleK1,
     TaxpayerProfile,
 )
@@ -61,6 +63,8 @@ def deserialize_profile(data: dict) -> TaxpayerProfile:
     d["forms_1099_div"] = [Form1099DIV(**f) for f in d.get("forms_1099_div", [])]
     d["forms_1099_b"] = [Form1099B(**f) for f in d.get("forms_1099_b", [])]
     d["schedule_k1s"] = [ScheduleK1(**k) for k in d.get("schedule_k1s", [])]
+    d["forms_1099_r"] = [Form1099R(**f) for f in d.get("forms_1099_r", [])]
+    d["schedule_e_properties"] = [ScheduleEProperty(**p) for p in d.get("schedule_e_properties", [])]
     d["dependents"] = [Dependent(**dep) for dep in d.get("dependents", [])]
     d["estimated_payments"] = [
         EstimatedPayment(**p) for p in d.get("estimated_payments", [])

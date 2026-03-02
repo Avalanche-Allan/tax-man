@@ -263,6 +263,72 @@ class Form1099B:
 
 
 @dataclass
+class Form1099R:
+    """1099-R: Distributions From Pensions, Annuities, Retirement, etc."""
+    payer_name: str = ""
+    payer_tin: str = ""
+    gross_distribution: float = 0.0      # Box 1
+    taxable_amount: float = 0.0          # Box 2a
+    federal_tax_withheld: float = 0.0    # Box 4
+    distribution_code: str = ""          # Box 7 (e.g., "1" = early)
+    is_early_distribution: bool = False  # Code 1 or 2 (before 59.5)
+    tax_year: int = 2025
+
+    def __post_init__(self):
+        if self.payer_tin:
+            self.payer_tin = validate_ein(self.payer_tin, "payer_tin")
+        validate_non_negative(self.gross_distribution, "gross_distribution")
+        validate_non_negative(self.taxable_amount, "taxable_amount")
+        validate_non_negative(self.federal_tax_withheld, "federal_tax_withheld")
+
+
+@dataclass
+class ScheduleEProperty:
+    """Schedule E Part I: Direct rental property (not via partnership K-1)."""
+    property_address: str = ""
+    property_type: str = "single_family"
+    ownership_pct: float = 100.0
+    days_rented: int = 365
+    days_personal: int = 0
+    gross_rents: float = 0.0             # Your share
+    advertising: float = 0.0
+    auto_travel: float = 0.0
+    cleaning_maintenance: float = 0.0
+    commissions: float = 0.0
+    insurance: float = 0.0
+    legal_professional: float = 0.0
+    management_fees: float = 0.0
+    mortgage_interest: float = 0.0
+    other_interest: float = 0.0
+    repairs: float = 0.0
+    supplies: float = 0.0
+    taxes: float = 0.0
+    utilities: float = 0.0
+    depreciation: float = 0.0
+    pmi: float = 0.0
+    other_expenses: float = 0.0
+    tax_year: int = 2025
+
+    def __post_init__(self):
+        validate_non_negative(self.gross_rents, "gross_rents")
+        validate_percentage(self.ownership_pct, "ownership_pct")
+
+    @property
+    def total_expenses(self) -> float:
+        return (
+            self.advertising + self.auto_travel + self.cleaning_maintenance
+            + self.commissions + self.insurance + self.legal_professional
+            + self.management_fees + self.mortgage_interest + self.other_interest
+            + self.repairs + self.supplies + self.taxes + self.utilities
+            + self.depreciation + self.pmi + self.other_expenses
+        )
+
+    @property
+    def net_income(self) -> float:
+        return self.gross_rents - self.total_expenses
+
+
+@dataclass
 class Dependent:
     """A dependent claimed on the return."""
     first_name: str = ""
@@ -485,6 +551,8 @@ class TaxpayerProfile:
     forms_1099_div: list[Form1099DIV] = field(default_factory=list)
     forms_1099_b: list[Form1099B] = field(default_factory=list)
     schedule_k1s: list[ScheduleK1] = field(default_factory=list)
+    forms_1099_r: list[Form1099R] = field(default_factory=list)
+    schedule_e_properties: list[ScheduleEProperty] = field(default_factory=list)
 
     # Dependents
     dependents: list[Dependent] = field(default_factory=list)
@@ -501,9 +569,14 @@ class TaxpayerProfile:
     days_in_foreign_country_2025: int = 0
     foreign_country: str = "Mexico"
     foreign_tax_paid: float = 0.0  # Should be 0 per user
+    us_business_days: int = 0  # Business days physically in US (for FEIE allocation)
+    total_work_days: int = 240  # Total work days in year (default 240)
 
     # Prior year (for quarterly estimated payment safe harbor)
     prior_year_tax: float = 0.0
+
+    # NOL
+    nol_carryforward: float = 0.0
 
     # State
     has_colorado_filing_obligation: bool = False  # Evaluate based on rental property

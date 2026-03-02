@@ -154,13 +154,13 @@ class TestFieldInventory:
         fields = self._get_pdf_fields("f1040")
         # Critical fields used in build_1040_data()
         expected = [
-            "f1_01[0]", "f1_02[0]",  # Name
+            "f1_14[0]", "f1_15[0]",  # First name, last name
             "f1_47[0]",  # Line 1a wages
-            "f1_63[0]",  # Line 9 total income
-            "f1_65[0]",  # Line 11 AGI
-            "f1_69[0]",  # Line 15 taxable income
-            "f2_01[0]",  # Line 16 tax
-            "f2_09[0]",  # Line 24 total tax
+            "f1_73[0]",  # Line 9 total income
+            "f1_75[0]",  # Line 11a AGI
+            "f2_06[0]",  # Line 15 taxable income
+            "f2_08[0]",  # Line 16 tax
+            "f2_16[0]",  # Line 24 total tax
         ]
         for key in expected:
             assert key in fields, f"Field {key} missing from f1040 PDF"
@@ -172,7 +172,7 @@ class TestFieldInventory:
             "f1_10[0]",  # Line 1 gross receipts
             "f1_16[0]",  # Line 7 gross income
             "f1_41[0]",  # Line 28 total expenses
-            "f1_44[0]",  # Line 31 net profit
+            "f1_46[0]",  # Line 31 net profit
         ]
         for key in expected:
             assert key in fields, f"Field {key} missing from Schedule C PDF"
@@ -183,8 +183,8 @@ class TestFieldInventory:
             "f1_1[0]",   # Name
             "f1_5[0]",   # Line 2 net SE income
             "f1_7[0]",   # Line 4a taxable SE earnings
-            "f1_17[0]",  # Line 12 SE tax
-            "f1_18[0]",  # Line 13 deductible part
+            "f1_21[0]",  # Line 12 SE tax
+            "f1_22[0]",  # Line 13 deductible part
         ]
         for key in expected:
             assert key in fields, f"Field {key} missing from Schedule SE PDF"
@@ -194,7 +194,8 @@ class TestFieldInventory:
         expected = [
             "f1_1[0]",   # Name
             "f2_1[0]",   # Page 2 name
-            "f2_48[0]",  # Total schedule E income
+            "f2_78[0]",  # Line 41 total schedule E income
+            "f1_84[0]",  # Line 26 rental total
         ]
         for key in expected:
             assert key in fields, f"Field {key} missing from Schedule E PDF"
@@ -204,8 +205,8 @@ class TestFieldInventory:
         expected = [
             "f1_01[0]",  # Name
             "f1_02[0]",  # SSN
-            "f1_18[0]",  # Line 6 total QBI
-            "f1_26[0]",  # Line 14 QBI deduction
+            "f1_18[0]",  # Line 2 total QBI
+            "f1_31[0]",  # Line 15 QBI deduction
         ]
         for key in expected:
             assert key in fields, f"Field {key} missing from Form 8995 PDF"
@@ -215,8 +216,8 @@ class TestFieldInventory:
         expected = [
             "f1_1[0]",   # Name
             "f1_3[0]",   # Line 1 foreign country
-            "f2_4[0]",   # Line 22 SE foreign income
-            "f2_25[0]",  # Line 42 exclusion
+            "f2_29[0]",  # Line 20a business income
+            "f3_19[0]",  # Line 42 exclusion
         ]
         for key in expected:
             assert key in fields, f"Field {key} missing from Form 2555 PDF"
@@ -241,8 +242,8 @@ class TestScheduleCLineMath:
 
         line7 = _parse_currency(data.get("f1_16[0]", "0"))   # gross income
         line28 = _parse_currency(data.get("f1_41[0]", "0"))   # total expenses before HO
-        line30 = _parse_currency(data.get("f1_43[0]", "0"))   # home office
-        line31 = _parse_currency(data.get("f1_44[0]", "0"))   # net profit
+        line30 = _parse_currency(data.get("f1_45[0]", "0"))   # home office
+        line31 = _parse_currency(data.get("f1_46[0]", "0"))   # net profit
 
         assert line31 == line7 - line28 - line30, (
             f"Line 31 ({line31}) != Line 7 ({line7}) - Line 28 ({line28}) - Line 30 ({line30})"
@@ -287,7 +288,7 @@ class TestScheduleCLineMath:
         data = build_schedule_c_data(sc, profile.businesses[0], profile)
 
         # All lines should be empty (zero formatted as "")
-        assert data.get("f1_44[0]", "") == ""  # net profit = 0
+        assert data.get("f1_46[0]", "") == ""  # net profit = 0
 
     def test_no_home_office_line28_equals_total_expenses(self):
         """Without home office, Line 28 should equal total expenses."""
@@ -307,7 +308,7 @@ class TestScheduleCLineMath:
         data = build_schedule_c_data(sc, profile.businesses[0], profile)
 
         line28 = _parse_currency(data.get("f1_41[0]", "0"))
-        line30 = _parse_currency(data.get("f1_43[0]", "0"))
+        line30 = _parse_currency(data.get("f1_45[0]", "0"))
 
         assert line28 == 1500  # 1000 + 500
         assert line30 == 0
@@ -322,8 +323,8 @@ class TestScheduleSELineMath:
 
         data = build_schedule_se_data(se, _build_test_profile())
 
-        se_tax = _parse_currency(data.get("f1_17[0]", "0"))      # Line 12
-        deductible = _parse_currency(data.get("f1_18[0]", "0"))   # Line 13
+        se_tax = _parse_currency(data.get("f1_21[0]", "0"))      # Line 12
+        deductible = _parse_currency(data.get("f1_22[0]", "0"))   # Line 13
 
         if se_tax > 0:
             assert abs(deductible - se_tax / 2) < 1, (
@@ -339,7 +340,7 @@ class TestForm1040LineMath:
         profile = _build_test_profile()
         data = build_1040_data(result, profile)
 
-        total_income = _parse_currency(data.get("f1_63[0]", "0"))  # Line 9
+        total_income = _parse_currency(data.get("f1_73[0]", "0"))  # Line 9
         assert total_income == round(result.total_income), (
             f"Line 9 ({total_income}) != result.total_income ({result.total_income})"
         )
@@ -349,9 +350,9 @@ class TestForm1040LineMath:
         profile = _build_test_profile()
         data = build_1040_data(result, profile)
 
-        total_income = _parse_currency(data.get("f1_63[0]", "0"))  # Line 9
-        adjustments = _parse_currency(data.get("f1_64[0]", "0"))   # Line 10
-        agi = _parse_currency(data.get("f1_65[0]", "0"))           # Line 11
+        total_income = _parse_currency(data.get("f1_73[0]", "0"))  # Line 9
+        adjustments = _parse_currency(data.get("f1_74[0]", "0"))   # Line 10
+        agi = _parse_currency(data.get("f1_75[0]", "0"))           # Line 11a
 
         assert agi == total_income - adjustments
 
@@ -360,9 +361,9 @@ class TestForm1040LineMath:
         profile = _build_test_profile()
         data = build_1040_data(result, profile)
 
-        agi = _parse_currency(data.get("f1_65[0]", "0"))           # Line 11
-        total_ded = _parse_currency(data.get("f1_68[0]", "0"))     # Line 14 (std + QBI)
-        taxable = _parse_currency(data.get("f1_69[0]", "0"))       # Line 15
+        agi = _parse_currency(data.get("f2_01[0]", "0"))           # Line 11b (page 2)
+        total_ded = _parse_currency(data.get("f2_05[0]", "0"))     # Line 14 (std + QBI)
+        taxable = _parse_currency(data.get("f2_06[0]", "0"))       # Line 15
 
         expected = max(agi - total_ded, 0)
         assert taxable == expected, (
@@ -374,7 +375,7 @@ class TestForm1040LineMath:
         profile = _build_test_profile()
         data = build_1040_data(result, profile)
 
-        total_tax = _parse_currency(data.get("f2_09[0]", "0"))  # Line 24
+        total_tax = _parse_currency(data.get("f2_16[0]", "0"))  # Line 24
         assert total_tax == round(result.total_tax)
 
     def test_other_taxes_sum(self):
@@ -383,8 +384,8 @@ class TestForm1040LineMath:
         profile = _build_test_profile()
         data = build_1040_data(result, profile)
 
-        other_taxes = _parse_currency(data.get("f2_08[0]", "0"))  # Line 23
-        expected = round(result.se_tax + result.additional_medicare + result.niit + result.amt)
+        other_taxes = _parse_currency(data.get("f2_15[0]", "0"))  # Line 23
+        expected = round(result.se_tax + result.additional_medicare + result.niit + result.early_withdrawal_penalty)
         assert other_taxes == expected
 
 
@@ -398,8 +399,8 @@ class TestForm8995LineMath:
         if result.qbi and result.qbi.qbi_deduction > 0:
             data = build_8995_data(result.qbi, result, profile)
 
-            total_qbi = _parse_currency(data.get("f1_18[0]", "0"))   # Line 6
-            qbi_ded = _parse_currency(data.get("f1_26[0]", "0"))     # Line 14
+            total_qbi = _parse_currency(data.get("f1_18[0]", "0"))   # Line 2
+            qbi_ded = _parse_currency(data.get("f1_31[0]", "0"))     # Line 15
 
             assert total_qbi > 0
             assert qbi_ded > 0
@@ -422,19 +423,19 @@ class TestForm2555LineMath:
         profile = _build_test_profile()
         data = build_2555_data(feie, profile)
 
-        # Line 22/24: foreign earned income
-        line22 = _parse_currency(data.get("f2_4[0]", "0"))
-        line24 = _parse_currency(data.get("f2_6[0]", "0"))
-        assert line22 == 80000
+        # Line 20a/24: foreign earned income
+        line20a = _parse_currency(data.get("f2_29[0]", "0"))
+        line24 = _parse_currency(data.get("f2_51[0]", "0"))
+        assert line20a == 80000
         assert line24 == 80000
 
         # Line 42: exclusion amount
-        line42 = _parse_currency(data.get("f2_25[0]", "0"))
+        line42 = _parse_currency(data.get("f3_19[0]", "0"))
         assert line42 == 75000
 
-        # Line 44: total exclusion
-        line44 = _parse_currency(data.get("f2_27[0]", "0"))
-        assert line44 == 75000
+        # Line 43: total exclusion
+        line43 = _parse_currency(data.get("f3_20[0]", "0"))
+        assert line43 == 75000
 
 
 # =============================================================================

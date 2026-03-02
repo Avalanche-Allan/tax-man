@@ -31,9 +31,11 @@ from taxman.models import (
     BusinessType,
     EstimatedPayment,
     FilingStatus,
+    Form1099R,
     HealthInsurance,
     HomeOffice,
     ScheduleCData,
+    ScheduleEProperty,
     ScheduleK1,
     TaxpayerProfile,
 )
@@ -231,6 +233,22 @@ def _get_step_spec(step_name: str) -> StepSpec:
                     help_text="Each K-1: {\"partnership_name\": \"...\", \"net_rental_income\": 5000, "
                               "\"ordinary_business_income\": 0, \"guaranteed_payments\": 0, \"is_sstb\": false}.",
                 ),
+                FieldSpec(
+                    name="forms_1099_r",
+                    field_type="text",
+                    prompt="1099-R distributions as JSON array",
+                    help_text="Each 1099-R: {\"payer_name\": \"Fidelity\", \"gross_distribution\": 103.95, "
+                              "\"taxable_amount\": 103.95, \"distribution_code\": \"1\", "
+                              "\"is_early_distribution\": true}.",
+                ),
+                FieldSpec(
+                    name="schedule_e_properties",
+                    field_type="text",
+                    prompt="Direct rental properties as JSON array (Schedule E Part I)",
+                    help_text="Each property: {\"property_address\": \"123 Main St\", \"gross_rents\": 12000, "
+                              "\"mortgage_interest\": 3000, \"taxes\": 1500, \"insurance\": 800, "
+                              "\"depreciation\": 2000, \"repairs\": 500}.",
+                ),
             ],
         ),
         "business_expenses": StepSpec(
@@ -301,6 +319,14 @@ def _get_step_spec(step_name: str) -> StepSpec:
                     help_text="Used for estimated payment safe harbor calculation. "
                               "If AGI > $150K (or $75K MFS), you need 110% of prior year tax.",
                 ),
+                FieldSpec(
+                    name="nol_carryforward",
+                    field_type="number",
+                    prompt="Net operating loss (NOL) carryforward from prior years ($)",
+                    default=0,
+                    help_text="NOL carryforward reduces AGI via Schedule 1, Line 8a. "
+                              "Enter the amount from your prior year NOL schedule.",
+                ),
             ],
         ),
         "foreign_income": StepSpec(
@@ -337,6 +363,23 @@ def _get_step_spec(step_name: str) -> StepSpec:
                     prompt="Days in the US during 2025",
                     default=0,
                     condition="lived_abroad == true",
+                ),
+                FieldSpec(
+                    name="us_business_days",
+                    field_type="number",
+                    prompt="Business days physically in the US (for FEIE income allocation)",
+                    default=0,
+                    condition="lived_abroad == true",
+                    help_text="Days you were in the US and working. Income earned during "
+                              "US business days is NOT excludable under FEIE.",
+                ),
+                FieldSpec(
+                    name="total_work_days",
+                    field_type="number",
+                    prompt="Total work days in the year",
+                    default=240,
+                    condition="lived_abroad == true",
+                    help_text="Default 240 (48 weeks × 5 days). Used for FEIE income allocation ratio.",
                 ),
             ],
         ),
@@ -686,6 +729,56 @@ def _process_income_review(session: SessionState, profile: TaxpayerProfile, answ
             is_sstb=k1.get("is_sstb", False),
         ))
 
+    # 1099-R distributions
+    r_raw = answers.get("forms_1099_r", [])
+    if isinstance(r_raw, str):
+        try:
+            r_raw = json.loads(r_raw)
+        except json.JSONDecodeError:
+            r_raw = []
+
+    if r_raw:
+        profile.forms_1099_r = []
+        for r in r_raw:
+            profile.forms_1099_r.append(Form1099R(
+                payer_name=r.get("payer_name", ""),
+                gross_distribution=float(r.get("gross_distribution", 0)),
+                taxable_amount=float(r.get("taxable_amount", 0)),
+                federal_tax_withheld=float(r.get("federal_tax_withheld", 0)),
+                distribution_code=r.get("distribution_code", ""),
+                is_early_distribution=r.get("is_early_distribution", False),
+            ))
+
+    # Schedule E rental properties
+    props_raw = answers.get("schedule_e_properties", [])
+    if isinstance(props_raw, str):
+        try:
+            props_raw = json.loads(props_raw)
+        except json.JSONDecodeError:
+            props_raw = []
+
+    if props_raw:
+        profile.schedule_e_properties = []
+        expense_fields = [
+            "advertising", "auto_travel", "cleaning_maintenance", "commissions",
+            "insurance", "legal_professional", "management_fees", "mortgage_interest",
+            "other_interest", "repairs", "supplies", "taxes", "utilities",
+            "depreciation", "pmi", "other_expenses",
+        ]
+        for p in props_raw:
+            kwargs = {
+                "property_address": p.get("property_address", ""),
+                "property_type": p.get("property_type", "single_family"),
+                "ownership_pct": float(p.get("ownership_pct", 100)),
+                "days_rented": int(p.get("days_rented", 365)),
+                "days_personal": int(p.get("days_personal", 0)),
+                "gross_rents": float(p.get("gross_rents", 0)),
+            }
+            for ef in expense_fields:
+                if ef in p:
+                    kwargs[ef] = float(p[ef])
+            profile.schedule_e_properties.append(ScheduleEProperty(**kwargs))
+
     _save_profile(session, profile)
 
     return {
@@ -698,6 +791,16 @@ def _process_income_review(session: SessionState, profile: TaxpayerProfile, answ
              "net_rental_income": k.net_rental_income,
              "ordinary_business_income": k.ordinary_business_income}
             for k in profile.schedule_k1s
+        ],
+        "forms_1099_r": [
+            {"payer_name": r.payer_name, "taxable_amount": r.taxable_amount,
+             "is_early": r.is_early_distribution}
+            for r in profile.forms_1099_r
+        ],
+        "rental_properties": [
+            {"address": p.property_address, "gross_rents": p.gross_rents,
+             "net_income": p.net_income}
+            for p in profile.schedule_e_properties
         ],
     }
 
@@ -857,11 +960,20 @@ def _process_deductions(session: SessionState, profile: TaxpayerProfile, answers
         except (ValueError, TypeError):
             pass
 
+    # NOL carryforward
+    nol = answers.get("nol_carryforward", None)
+    if nol is not None:
+        try:
+            profile.nol_carryforward = float(str(nol).replace(",", "").replace("$", ""))
+        except (ValueError, TypeError):
+            pass
+
     _save_profile(session, profile)
     return {
         "health_insurance": profile.health_insurance is not None,
         "estimated_payments_total": profile.total_estimated_payments,
         "prior_year_tax": profile.prior_year_tax,
+        "nol_carryforward": profile.nol_carryforward,
     }
 
 
@@ -880,6 +992,8 @@ def _process_foreign_income(session: SessionState, profile: TaxpayerProfile, ans
     profile.foreign_country = answers.get("foreign_country", profile.foreign_country or "Mexico")
     profile.days_in_foreign_country_2025 = int(answers.get("days_abroad", 330))
     profile.days_in_us_2025 = int(answers.get("days_us", 0))
+    profile.us_business_days = int(answers.get("us_business_days", 0))
+    profile.total_work_days = int(answers.get("total_work_days", 240))
 
     feie_eligible = profile.days_in_foreign_country_2025 >= 330
 
@@ -889,6 +1003,8 @@ def _process_foreign_income(session: SessionState, profile: TaxpayerProfile, ans
         "foreign_country": profile.foreign_country,
         "days_abroad": profile.days_in_foreign_country_2025,
         "days_us": profile.days_in_us_2025,
+        "us_business_days": profile.us_business_days,
+        "total_work_days": profile.total_work_days,
         "feie_eligible": feie_eligible,
         "feie_note": (
             "You meet the Physical Presence Test for FEIE."

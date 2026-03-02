@@ -5,6 +5,7 @@ Uses PyPDFForm for pure-Python PDF manipulation (no pdftk needed).
 """
 
 import os
+import shutil
 import urllib.request
 from pathlib import Path
 
@@ -33,12 +34,84 @@ _DEFAULT_FORMS_DIR = Path(__file__).resolve().parent.parent / "forms"
 FORMS_DIR = Path(os.environ.get("TAXMAN_FORMS_DIR", str(_DEFAULT_FORMS_DIR)))
 
 
+def _patch_checkbox_appearances(pdf_path: Path) -> None:
+    """Add missing /Off appearance streams to checkbox widgets in a PDF.
+
+    IRS PDFs authored by Adobe LiveCycle create checkbox /AP/N dicts with
+    only the checked-state entry (/1) and no /Off entry.  This is technically
+    valid per the PDF spec, but macOS Preview does not handle it correctly:
+    when /AP/N has no /Off stream, Preview falls back to synthesizing a
+    checkmark glyph from /MK/CA regardless of /AS, making every checkbox
+    appear checked.
+
+    This function patches the source PDF in-place (incremental save) to add
+    an empty /Off XObject form stream to /AP/N for every checkbox that lacks
+    one.  After patching, PyPDFForm's fill carries the /Off stream through,
+    and Preview correctly renders unchecked boxes as empty.
+    """
+    try:
+        import fitz
+    except ImportError:
+        return  # pymupdf not installed; skip patching
+
+    # Work on a copy so we can do an incremental save
+    tmp_path = str(pdf_path) + ".patching"
+    shutil.copy(str(pdf_path), tmp_path)
+
+    doc = fitz.open(tmp_path)
+    patched = 0
+
+    for page in doc:
+        for widget in page.widgets():
+            if widget.field_type != fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                continue
+
+            xref = widget.xref
+            ap_n = doc.xref_get_key(xref, "AP/N")
+            if ap_n[0] != "dict" or "/Off" in ap_n[1]:
+                continue  # Already has /Off or no /AP/N dict
+
+            # Create an empty XObject form stream for the Off state
+            rect = widget.rect
+            w, h = rect.width, rect.height
+            off_xref = doc.get_new_xref()
+            doc.update_object(
+                off_xref,
+                f"<</Type/XObject/Subtype/Form"
+                f"/BBox[0 0 {w:.3f} {h:.3f}]/Length 0>>",
+            )
+            doc.update_stream(off_xref, b"")
+
+            # Insert /Off reference into the existing /AP/N dict
+            new_dict = ap_n[1].replace(">>", f"/Off {off_xref} 0 R>>")
+            doc.xref_set_key(xref, "AP/N", new_dict)
+            patched += 1
+
+    if patched:
+        doc.save(tmp_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+        doc.close()
+        os.replace(tmp_path, str(pdf_path))
+    else:
+        doc.close()
+        os.unlink(tmp_path)
+
+
+# Sentinel file indicating a cached PDF has been checkbox-patched.
+_PATCH_SUFFIX = ".checkbox_patched"
+
+
 def download_irs_form(form_key: str, force: bool = False) -> Path:
     """Download an IRS PDF form if not already cached."""
     FORMS_DIR.mkdir(parents=True, exist_ok=True)
 
     output_path = FORMS_DIR / f"{form_key}.pdf"
+    patch_marker = FORMS_DIR / f"{form_key}{_PATCH_SUFFIX}"
+
     if output_path.exists() and not force:
+        # Patch checkboxes if not already done for this cached copy
+        if not patch_marker.exists():
+            _patch_checkbox_appearances(output_path)
+            patch_marker.touch()
         return output_path
 
     url = IRS_FORM_URLS.get(form_key)
@@ -47,6 +120,8 @@ def download_irs_form(form_key: str, force: bool = False) -> Path:
 
     print(f"Downloading {form_key} from {url}...")
     urllib.request.urlretrieve(url, output_path)
+    _patch_checkbox_appearances(output_path)
+    patch_marker.touch()
     print(f"Saved to {output_path}")
     return output_path
 

@@ -281,7 +281,11 @@ class TaxCreditsResult:
 class Form2555Result:
     """Calculated FEIE."""
     foreign_earned_income: float = 0.0
+    us_earned_income: float = 0.0  # Income earned during US business days
+    gross_earned_income: float = 0.0  # Total gross before allocation
     exclusion_amount: float = 0.0
+    allocable_deductions: float = 0.0  # Line 44 — deductions allocable to excluded income
+    net_exclusion: float = 0.0  # Line 45 — exclusion minus allocable deductions
     is_beneficial: bool = False
     tax_with_feie: float = 0.0
     tax_without_feie: float = 0.0
@@ -298,6 +302,7 @@ class Form1040Result:
     taxable_interest: float = 0.0      # Line 2b
     qualified_dividends: float = 0.0   # Line 3a
     ordinary_dividends: float = 0.0    # Line 3b
+    ira_distributions: float = 0.0     # Line 4a (gross) / 4b (taxable)
     capital_gain_loss: float = 0.0     # Line 7
     total_income: float = 0.0          # Line 9
     adjustments: float = 0.0           # Line 10
@@ -311,6 +316,7 @@ class Form1040Result:
     additional_medicare: float = 0.0   # Schedule 2
     niit: float = 0.0                  # Schedule 2 (Net Investment Income Tax)
     amt: float = 0.0                  # Schedule 2 (Alternative Minimum Tax)
+    early_withdrawal_penalty: float = 0.0  # Schedule 2, Line 8 (10% on early 1099-R)
     nonrefundable_credits: float = 0.0  # Line 21 (CTC + ODC nonrefundable)
     total_tax: float = 0.0            # Line 24
     # Payments
@@ -402,7 +408,7 @@ def calculate_schedule_c(biz: ScheduleCData) -> ScheduleCResult:
         ("24b", "Meals (50%)", round(exp.meals * MEALS_DEDUCTION_PCT, 2)),
         ("25", "Utilities", exp.utilities),
         ("26", "Wages", exp.wages),
-        ("27a", "Other expenses", exp.other_expenses),
+        ("27b", "Other expenses", exp.other_expenses),
     ]
 
     total_expenses = 0.0
@@ -514,13 +520,8 @@ def calculate_schedule_se(
 def calculate_schedule_e(profile: TaxpayerProfile) -> ScheduleEResult:
     """Calculate Schedule E (Supplemental Income and Loss).
 
-    Handles all K-1 income boxes and flows them to the correct places:
-    - Box 1: Ordinary business income → Schedule E Part II
-    - Box 2: Net rental income → Schedule E Part II
-    - Box 4: Guaranteed payments → Schedule E Part II (also subject to SE tax)
-    - Box 5: Interest income → flows to Schedule B / Form 1040
-    - Box 9a: Net LTCG → flows to Schedule D / Form 1040
-    - Box 14: Self-employment earnings → used for Schedule SE
+    Part I: Direct rental properties (ScheduleEProperty)
+    Part II: K-1 income from partnerships
 
     For MFS filers: passive rental losses cannot offset non-passive income
     (IRC §469(i)(5)(B) — the $25K special allowance is $0 for MFS).
@@ -528,6 +529,25 @@ def calculate_schedule_e(profile: TaxpayerProfile) -> ScheduleEResult:
     result = ScheduleEResult()
     lines = []
 
+    # ─── PART I: Direct Rental Properties ─────────────────────
+    for prop in profile.schedule_e_properties:
+        rental_net = prop.net_income
+        if rental_net < 0 and profile.filing_status == FilingStatus.MFS:
+            # MFS gets $0 passive loss allowance
+            lines.append(LineItem("Schedule E", "Part I",
+                                  f"Rental loss from {prop.property_address} (SUSPENDED)",
+                                  0.0,
+                                  f"Actual loss: ${rental_net:,.2f}. MFS filers get $0 passive "
+                                  f"loss allowance (IRC §469(i)(5)(B)). Loss is suspended."))
+        else:
+            result.net_rental_income += rental_net
+            lines.append(LineItem("Schedule E", "Part I",
+                                  f"Rental income from {prop.property_address}",
+                                  round(rental_net, 2),
+                                  f"Gross rents ${prop.gross_rents:,.2f} − "
+                                  f"expenses ${prop.total_expenses:,.2f}"))
+
+    # ─── PART II: K-1 Income ──────────────────────────────────
     for k1 in profile.schedule_k1s:
         # Box 2: Net rental income (passive)
         rental = k1.net_rental_income
@@ -1079,6 +1099,8 @@ def evaluate_feie(
     taxable_income_no_feie: float,
     tax_without_feie: float,
     earned_income: float,
+    gross_receipts: float = 0.0,
+    se_deduction: float = 0.0,
 ) -> Form2555Result:
     """Evaluate whether the Foreign Earned Income Exclusion is beneficial.
 
@@ -1088,16 +1110,26 @@ def evaluate_feie(
     2. Compute tax on the excluded amount
     3. Tax with FEIE = (1) minus (2)
 
+    Day-based allocation (Form 2555 Part IV):
+    - Allocates gross earned income between US and foreign based on
+      us_business_days / total_work_days ratio
+    - Only the foreign portion is excludable
+    - Deductions allocable to excluded income (Line 44) reduce the exclusion
+
     Args:
         profile: Taxpayer profile
         taxable_income_no_feie: Actual taxable income without FEIE
         tax_without_feie: Income tax computed without FEIE
-        earned_income: Total foreign earned income (Schedule C profits)
+        earned_income: Net earned income (Schedule C net profits)
+        gross_receipts: Gross Schedule C receipts (for day-based allocation)
+        se_deduction: Deductible part of SE tax (1/2 SE tax)
     """
     result = Form2555Result()
     lines = []
 
-    result.foreign_earned_income = earned_income
+    # Use gross receipts for allocation if available, else fall back to net
+    gross = gross_receipts if gross_receipts > 0 else earned_income
+    result.gross_earned_income = gross
 
     # Physical presence test (330 days in any consecutive 12-month period)
     days_abroad = profile.days_in_foreign_country_2025
@@ -1116,19 +1148,67 @@ def evaluate_feie(
         result.lines = lines
         return result
 
-    # Exclusion amount
-    exclusion = min(earned_income, FEIE_EXCLUSION_LIMIT)
+    # Day-based income allocation (Form 2555 Part IV, Line 20a)
+    us_biz_days = profile.us_business_days
+    total_days = profile.total_work_days
+    if us_biz_days > 0 and total_days > 0:
+        us_earned = round(gross * us_biz_days / total_days, 2)
+        foreign_earned = round(gross - us_earned, 2)
+    else:
+        # No US business days specified — all income is foreign
+        us_earned = 0.0
+        foreign_earned = gross
+
+    result.us_earned_income = us_earned
+    result.foreign_earned_income = foreign_earned
+
+    lines.append(LineItem("Form 2555", "20a",
+                          "Foreign earned income allocation",
+                          foreign_earned,
+                          f"Gross earned income: ${gross:,.2f}. "
+                          f"US business days: {us_biz_days}/{total_days}. "
+                          f"US-earned: ${us_earned:,.2f}. "
+                          f"Foreign-earned: ${foreign_earned:,.2f}"))
+
+    # Exclusion amount (Line 42) — lesser of foreign earned or limit
+    exclusion = min(foreign_earned, FEIE_EXCLUSION_LIMIT)
     result.exclusion_amount = exclusion
     lines.append(LineItem("Form 2555", "42",
                           "Foreign earned income exclusion",
                           round(exclusion, 2),
-                          f"Lesser of earned income ${earned_income:,.2f} "
+                          f"Lesser of foreign earned ${foreign_earned:,.2f} "
                           f"or limit ${FEIE_EXCLUSION_LIMIT:,}"))
+
+    # Allocable deductions (Line 44)
+    # Per Form 2555: deductions allocable to excluded income =
+    # (exclusion / total earned) × (1/2 SE tax + Schedule C expenses)
+    schedule_c_expenses = gross - earned_income  # gross - net = expenses
+    total_deductions = se_deduction + max(schedule_c_expenses, 0)
+    if gross > 0:
+        alloc_ratio = exclusion / gross
+    else:
+        alloc_ratio = 0.0
+    allocable_deductions = round(total_deductions * alloc_ratio, 2)
+    result.allocable_deductions = allocable_deductions
+
+    # Net exclusion (Line 45) = exclusion - allocable deductions
+    net_exclusion = round(exclusion - allocable_deductions, 2)
+    result.net_exclusion = net_exclusion
+
+    lines.append(LineItem("Form 2555", "44-45",
+                          "Allocable deductions and net exclusion",
+                          net_exclusion,
+                          f"Total deductions: ${total_deductions:,.2f} "
+                          f"(1/2 SE ${se_deduction:,.2f} + "
+                          f"Sch C expenses ${max(schedule_c_expenses, 0):,.2f}). "
+                          f"Allocable ratio: {alloc_ratio:.4f}. "
+                          f"Allocable deductions (Line 44): "
+                          f"${allocable_deductions:,.2f}. "
+                          f"Net exclusion (Line 45): ${net_exclusion:,.2f}"))
 
     # Stacking method: use actual taxable income, not raw earned income
     # Tax on full taxable income (already computed as tax_without_feie)
     # Tax on excluded portion (at the bottom of the bracket stack)
-    # Bug 3 fix: use correct brackets for filing status
     brackets = BRACKETS_BY_STATUS.get(profile.filing_status, MFS_BRACKETS)
     tax_on_excluded = calculate_income_tax(exclusion, brackets)
     tax_with_feie = max(tax_without_feie - tax_on_excluded, 0)
@@ -1186,13 +1266,13 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                               sc.net_profit_loss,
                               "From Schedule C, Line 31"))
 
-    # ─── SCHEDULE E (K-1 income) ───────────────────────────────
+    # ─── SCHEDULE E (Rental + K-1 income) ────────────────────────
     sch_e = None
     k1_se_income = 0.0
     k1_other_income = 0.0
     net_investment_income = 0.0
 
-    if profile.schedule_k1s:
+    if profile.schedule_k1s or profile.schedule_e_properties:
         sch_e = calculate_schedule_e(profile)
         result.schedule_e = sch_e
 
@@ -1277,6 +1357,18 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
         lines.append(LineItem("Form 1040", "1a", "Wages, salaries, tips",
                               result.wage_income))
 
+    # Lines 4a/4b: IRA distributions / pensions (1099-R)
+    ira_gross = sum(f.gross_distribution for f in profile.forms_1099_r)
+    ira_taxable = sum(f.taxable_amount for f in profile.forms_1099_r)
+    ira_withholding = sum(f.federal_tax_withheld for f in profile.forms_1099_r)
+    result.ira_distributions = round(ira_taxable, 2)
+    if ira_gross > 0:
+        lines.append(LineItem("Form 1040", "4a", "IRA distributions (gross)",
+                              round(ira_gross, 2)))
+    if ira_taxable > 0:
+        lines.append(LineItem("Form 1040", "4b", "IRA distributions (taxable)",
+                              result.ira_distributions))
+
     # Lines 2a/2b
     if result.tax_exempt_interest > 0:
         lines.append(LineItem("Form 1040", "2a", "Tax-exempt interest",
@@ -1298,14 +1390,24 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
         lines.append(LineItem("Form 1040", "7", "Capital gain or (loss)",
                               result.capital_gain_loss))
 
-    # Schedule 1 income: business + K-1 (non-investment portions)
+    # Schedule 1 income: business + K-1 (non-investment portions) − NOL
     schedule_1_income = total_business_income + k1_other_income
+
+    # NOL carryforward (Schedule 1, Line 8a — entered as negative)
+    nol = profile.nol_carryforward
+    if nol > 0:
+        schedule_1_income -= nol
+        lines.append(LineItem("Schedule 1", "8a",
+                              "Net operating loss deduction",
+                              round(-nol, 2),
+                              f"NOL carryforward from prior year: ${nol:,.2f}"))
+
     lines.append(LineItem("Form 1040", "8",
                           "Other income (Schedule 1)",
                           round(schedule_1_income, 2)))
 
     result.total_income = round(
-        wages + taxable_interest + ordinary_dividends
+        wages + ira_taxable + taxable_interest + ordinary_dividends
         + result.capital_gain_loss + schedule_1_income, 2
     )
     lines.append(LineItem("Form 1040", "9", "Total income",
@@ -1470,10 +1572,23 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                                   "Nonrefundable credits (CTC/ODC)",
                                   result.nonrefundable_credits))
 
+    # ─── EARLY WITHDRAWAL PENALTY (Schedule 2, Line 8) ────────
+    early_penalty = round(sum(
+        f.taxable_amount * 0.10
+        for f in profile.forms_1099_r if f.is_early_distribution
+    ), 2)
+    if early_penalty > 0:
+        result.early_withdrawal_penalty = early_penalty
+        lines.append(LineItem("Schedule 2", "8",
+                              "Early withdrawal penalty (10%)",
+                              early_penalty,
+                              "10% penalty on early distributions (Code 1/2)"))
+
     # ─── TOTAL TAX ─────────────────────────────────────────────
     result.total_tax = round(
         result.tax + result.se_tax + result.additional_medicare
-        + result.niit + result.amt - result.nonrefundable_credits, 2
+        + result.niit + result.amt + result.early_withdrawal_penalty
+        - result.nonrefundable_credits, 2
     )
     result.total_tax = max(result.total_tax, 0)
     lines.append(LineItem("Form 1040", "24", "Total tax",
@@ -1483,6 +1598,8 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                           f"Addl Medicare ${result.additional_medicare:,.2f}"
                           + (f" + NIIT ${result.niit:,.2f}" if result.niit else "")
                           + (f" + AMT ${result.amt:,.2f}" if result.amt else "")
+                          + (f" + early penalty ${result.early_withdrawal_penalty:,.2f}"
+                             if result.early_withdrawal_penalty else "")
                           + (f" - credits ${result.nonrefundable_credits:,.2f}"
                              if result.nonrefundable_credits else "")))
 
@@ -1494,6 +1611,7 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
         + sum(f.federal_tax_withheld for f in profile.forms_1099_div)
         + sum(f.federal_tax_withheld for f in profile.forms_1099_b)
         + sum(f.federal_tax_withheld for f in profile.forms_1099_nec)
+        + ira_withholding
     )
     result.withholding = round(w2_withholding + form_1099_withholding, 2)
     if result.withholding > 0:
@@ -1542,6 +1660,7 @@ def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
 
     # Total earned income from Schedule C businesses
     earned_income = sum(sc.net_profit_loss for sc in result_no_feie.schedule_c_results)
+    gross_receipts = sum(sc.gross_receipts for sc in result_no_feie.schedule_c_results)
 
     # Evaluate FEIE using actual taxable income and computed tax
     feie_eval = evaluate_feie(
@@ -1549,6 +1668,8 @@ def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
         taxable_income_no_feie=result_no_feie.taxable_income,
         tax_without_feie=result_no_feie.tax,
         earned_income=max(earned_income, 0),
+        gross_receipts=max(gross_receipts, 0),
+        se_deduction=result_no_feie.adjustments,
     )
 
     return {
