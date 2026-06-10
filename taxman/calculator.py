@@ -240,6 +240,9 @@ class Form8995Result:
     total_qbi: float = 0.0
     qbi_deduction: float = 0.0
     is_limited: bool = False
+    # (business_name, QBI net of allocated adjustments) per Schedule C
+    # business — feeds Form 8995 Line 1 rows
+    business_qbi: list = field(default_factory=list)
     lines: list[LineItem] = field(default_factory=list)
 
 
@@ -781,6 +784,19 @@ def calculate_qbi_deduction(
     schedule_c_qbi = sum(r.net_profit_loss for r in schedule_c_results)
     schedule_c_qbi -= business_adjustments
     total_qbi = schedule_c_qbi + k1_qbi
+
+    # Per-business QBI for Form 8995 Line 1: allocate the adjustments
+    # proportionally to each business's positive net profit
+    positive_total = sum(max(r.net_profit_loss, 0) for r in schedule_c_results)
+    for r in schedule_c_results:
+        if positive_total > 0:
+            share = (max(r.net_profit_loss, 0) / positive_total
+                     * business_adjustments)
+        else:
+            share = 0.0
+        result.business_qbi.append(
+            (r.business_name, round(r.net_profit_loss - share, 2))
+        )
     total_w2_wages = w2_wages + k1_w2_wages
     total_ubia = ubia + k1_ubia
     result.total_qbi = total_qbi

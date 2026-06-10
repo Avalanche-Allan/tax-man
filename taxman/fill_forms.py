@@ -179,21 +179,76 @@ def inspect_form_fields_raw(form_key: str) -> list[str]:
     return sorted(field_names)
 
 
+def _apply_qualified_fields(pdf_bytes: bytes, values: dict) -> bytes:
+    """Set widget values by fully-qualified field name using pymupdf.
+
+    PyPDFForm matches fields by short name (e.g. "c1_8[0]"), which is
+    ambiguous when a form reuses the same short name under different
+    parent nodes — the 2025 f1040 has two "c1_8" checkbox groups (left
+    column Single/MFJ/MFS, right column HOH/QSS), and filling the short
+    name checks a box in BOTH groups. Field-mapping keys containing a
+    '.' are treated as fully-qualified names and applied here instead.
+    """
+    import fitz
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    remaining = dict(values)
+    for page in doc:
+        for widget in page.widgets():
+            if widget.field_name not in remaining:
+                continue
+            value = remaining.pop(widget.field_name)
+            if widget.field_type == fitz.PDF_WIDGET_TYPE_CHECKBOX:
+                if value:
+                    states = (widget.button_states() or {}).get("normal", [])
+                    on_state = next((s for s in states if s != "Off"), "Yes")
+                    widget.field_value = on_state
+                    widget.update()
+            else:
+                widget.field_value = str(value)
+                widget.update()
+    out = doc.tobytes()
+    doc.close()
+    if remaining:
+        raise ValueError(
+            f"Fully-qualified fields not found in PDF: {sorted(remaining)}"
+        )
+    return out
+
+
+def _split_field_data(form_key: str, data: dict) -> tuple:
+    """Split field data into (PyPDFForm bytes-or-path source, short-name dict).
+
+    Keys containing '.' are fully-qualified names pre-applied to the
+    source PDF via pymupdf; the rest go through PyPDFForm.
+    """
+    pdf_path = download_irs_form(form_key)
+    qualified = {k: v for k, v in data.items() if "." in k}
+    simple = {k: v for k, v in data.items() if "." not in k}
+
+    if qualified:
+        source = _apply_qualified_fields(pdf_path.read_bytes(), qualified)
+    else:
+        source = str(pdf_path)
+    return source, simple
+
+
 def fill_form(form_key: str, data: dict, output_path: str) -> str:
     """Fill a PDF form with data and save the output.
 
     Args:
         form_key: Key from IRS_FORM_URLS (e.g., "f1040", "f1040sc")
-        data: Dict mapping PDF field names to values
+        data: Dict mapping PDF field names to values. Keys containing
+            '.' are fully-qualified names (see _apply_qualified_fields).
         output_path: Where to save the filled PDF
 
     Returns:
         Path to the filled PDF
     """
-    pdf_path = download_irs_form(form_key)
+    source, simple = _split_field_data(form_key, data)
 
-    wrapper = PdfWrapper(str(pdf_path))
-    wrapper.fill(data)
+    wrapper = PdfWrapper(source)
+    wrapper.fill(simple)
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -211,10 +266,10 @@ def fill_and_flatten(form_key: str, data: dict, output_path: str) -> str:
     Uses PyPDFForm's flatten=True parameter to burn field values
     into the page content, making the form read-only.
     """
-    pdf_path = download_irs_form(form_key)
+    source, simple = _split_field_data(form_key, data)
 
-    wrapper = PdfWrapper(str(pdf_path))
-    wrapper.fill(data, flatten=True)
+    wrapper = PdfWrapper(source)
+    wrapper.fill(simple, flatten=True)
 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)

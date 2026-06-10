@@ -48,6 +48,9 @@ def build_1040_data(result, profile) -> dict:
     if profile.spouse_ssn:
         # f1_19: Spouse's social security number
         data["f1_19[0]"] = profile.spouse_ssn.replace("-", "")
+    elif profile.filing_status.value == "mfs" and profile.spouse_is_nra:
+        # Per 1040 instructions: NRA spouse without SSN/ITIN → enter "NRA"
+        data["f1_19[0]"] = "NRA"
 
     # Address
     # f1_20: Home address (street)
@@ -66,22 +69,36 @@ def build_1040_data(result, profile) -> dict:
         # f1_26: Foreign province/state/county
         # f1_27: Foreign postal code
 
-    # Do NOT set c1_6[0] (Deceased) or c1_7[0] (Spouse deceased).
-    # The source PDF is pre-patched with /AP/N/Off appearances so PyPDFForm
-    # leaves them unchecked when omitted from the data dict.
+    # 2025 page-1 header checkboxes (verified by widget coordinates):
+    #   c1_1=Filed pursuant to 301.9100-2, c1_2=Combat zone, c1_3=Deceased,
+    #   c1_4=Other, c1_5=main home in U.S. more than half of 2025,
+    #   c1_6/c1_7=Presidential Election Campaign You/Spouse.
+    # Never set any of these. (c1_3 was the MFS box on the pre-2025 layout.)
 
-    # Filing status checkboxes
-    # c1_1[0]=Single, c1_2[0]=MFJ, c1_3[0]=MFS, c1_4[0]=HOH, c1_5[0]=QSS
+    # Filing status: the 2025 form has TWO checkbox groups that share the
+    # short name "c1_8" — left column (Single/MFJ/MFS) under
+    # Checkbox_ReadOrder[0] and right column (HOH/QSS) directly under
+    # Page1[0]. PyPDFForm's short-name matching checks a box in BOTH
+    # groups, so these must use fully-qualified names (handled by
+    # fill_form via pymupdf).
+    _fs_left = "topmostSubform[0].Page1[0].Checkbox_ReadOrder[0].c1_8"
+    _fs_right = "topmostSubform[0].Page1[0].c1_8"
     fs_map = {
-        "single": "c1_1[0]",
-        "mfj": "c1_2[0]",
-        "mfs": "c1_3[0]",
-        "hoh": "c1_4[0]",
-        "qss": "c1_5[0]",
+        "single": f"{_fs_left}[0]",
+        "mfj": f"{_fs_left}[1]",
+        "mfs": f"{_fs_left}[2]",
+        "hoh": f"{_fs_right}[0]",
+        "qss": f"{_fs_right}[1]",
     }
     fs_field = fs_map.get(profile.filing_status.value)
     if fs_field:
         data[fs_field] = True
+
+    # Digital assets question (required): c1_10[0]=Yes, c1_10[1]=No
+    if profile.received_digital_assets:
+        data["c1_10[0]"] = True
+    else:
+        data["c1_10[1]"] = True
 
     # MFS spouse full name on line below checkbox
     if profile.filing_status.value == "mfs" and profile.spouse_name:

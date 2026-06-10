@@ -358,6 +358,63 @@ class TestScheduleSELineMath:
         assert line_9 == SS_WAGE_BASE - 60_000
 
 
+class TestScheduleEPartI:
+    """Schedule E Part I: direct rental property fields."""
+
+    @staticmethod
+    def _rental_profile():
+        from taxman.models import ScheduleEProperty
+        return TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="123 Rental Ave, Denver, CO 80202",
+                property_type="single_family",
+                days_rented=365,
+                days_personal=0,
+                gross_rents=24_000,
+                mortgage_interest=6_000,
+                taxes=2_000,
+                management_fees=1_800,
+                repairs=500,
+                depreciation=7_000,
+            )],
+        )
+
+    def test_part_i_fields(self):
+        profile = self._rental_profile()
+        result = calculate_return(profile)
+        data = build_schedule_e_data(result.schedule_e, profile)
+
+        assert data["f1_3[0]"] == "123 Rental Ave, Denver, CO 80202"
+        assert data["f1_6[0]"] == "1"          # 1b: single family
+        assert data["f1_9[0]"] == "365"        # fair rental days
+        assert data["f1_10[0]"] == "0"         # personal use days
+        assert _parse_currency(data["f1_16[0]"]) == 24_000   # Line 3 rents
+        assert _parse_currency(data["f1_43[0]"]) == 6_000    # Line 12 mortgage
+        assert _parse_currency(data["f1_61[0]"]) == 7_000    # Line 18 depreciation
+        # Question A answered No by default
+        assert data.get("c1_1[1]") is True
+        assert "c1_1[0]" not in data
+
+    def test_question_a_yes(self):
+        profile = self._rental_profile()
+        profile.made_payments_requiring_1099 = True
+        result = calculate_return(profile)
+        data = build_schedule_e_data(result.schedule_e, profile)
+        assert data.get("c1_1[0]") is True
+        assert data.get("c1_2[0]") is True
+        assert "c1_1[1]" not in data
+
+    def test_net_income_line_21(self):
+        profile = self._rental_profile()
+        result = calculate_return(profile)
+        data = build_schedule_e_data(result.schedule_e, profile)
+        # 24,000 - (6,000+2,000+1,800+500+7,000) = 6,700
+        assert _parse_currency(data["f1_71[0]"]) == 6_700    # Line 21
+        assert _parse_currency(data["f1_82[0]"]) == 6_700    # Line 24 income
+        assert _parse_currency(data["f1_84[0]"]) == 6_700    # Line 26 total
+
+
 class TestForm1040LineMath:
     """Form 1040: income lines and tax consistency."""
 
@@ -431,6 +488,88 @@ class TestForm8995LineMath:
             assert total_qbi > 0
             assert qbi_ded > 0
             assert qbi_ded == round(result.qbi.qbi_deduction)
+
+    def test_line1_rows_sum_to_line2(self):
+        """Line 1 column (c) rows must add up to Line 2 (total QBI)."""
+        result = _build_test_result()
+        profile = _build_test_profile()
+        data = build_8995_data(result.qbi, result, profile)
+
+        row_fields = ["f1_05[0]", "f1_08[0]", "f1_11[0]", "f1_14[0]", "f1_17[0]"]
+        row_total = sum(_parse_currency(data.get(f, "0")) for f in row_fields)
+        line2 = _parse_currency(data.get("f1_18[0]", "0"))
+        # Each row is rounded to whole dollars, so allow $1 per row
+        assert abs(row_total - line2) <= len(row_fields)
+
+
+class TestForm1040Checkboxes:
+    """2025 f1040 checkbox layout: filing status and digital assets.
+
+    The 2025 form added a header checkbox row (301.9100-2 / Combat zone /
+    Deceased / Other), shifting c1_* indices, and split filing status
+    into two widget groups that share the short name "c1_8". These tests
+    catch any future re-shuffle by asserting on the filled PDF itself.
+    """
+
+    @staticmethod
+    def _checked_boxes(path) -> dict:
+        from pypdf import PdfReader
+        reader = PdfReader(path)
+        return {
+            name.split("Page1[0].")[-1]: str(f.get("/V"))
+            for name, f in reader.get_fields().items()
+            if f.get("/FT") == "/Btn"
+            and f.get("/V") and str(f.get("/V")) != "/Off"
+        }
+
+    @_skip_no_forms
+    @pytest.mark.parametrize("fs,expected_box", [
+        ("single", "Checkbox_ReadOrder[0].c1_8[0]"),
+        ("mfj", "Checkbox_ReadOrder[0].c1_8[1]"),
+        ("mfs", "Checkbox_ReadOrder[0].c1_8[2]"),
+        ("hoh", "c1_8[0]"),
+        ("qss", "c1_8[1]"),
+    ])
+    def test_filing_status_checks_exactly_one_box(self, tmp_path, fs, expected_box):
+        from taxman.fill_forms import fill_form
+        profile = _build_test_profile()
+        profile.filing_status = FilingStatus(fs)
+        result = _build_test_result(profile)
+        data = build_1040_data(result, profile)
+        path = fill_form("f1040", data, str(tmp_path / f"f1040_{fs}.pdf"))
+
+        checked = self._checked_boxes(path)
+        fs_boxes = sorted(k for k in checked if "c1_8" in k)
+        assert fs_boxes == [expected_box], (
+            f"{fs}: expected only {expected_box}, got {fs_boxes}"
+        )
+        # Deceased (c1_3 on the 2025 layout) must never be checked
+        assert "c1_3[0]" not in checked
+
+    @_skip_no_forms
+    def test_digital_assets_answered_no_by_default(self, tmp_path):
+        from taxman.fill_forms import fill_form
+        profile = _build_test_profile()
+        result = _build_test_result(profile)
+        data = build_1040_data(result, profile)
+        path = fill_form("f1040", data, str(tmp_path / "f1040.pdf"))
+
+        checked = self._checked_boxes(path)
+        assert "c1_10[1]" in checked   # No
+        assert "c1_10[0]" not in checked  # Yes
+
+    @_skip_no_forms
+    def test_digital_assets_yes(self, tmp_path):
+        from taxman.fill_forms import fill_form
+        profile = _build_test_profile()
+        profile.received_digital_assets = True
+        result = _build_test_result(profile)
+        data = build_1040_data(result, profile)
+        path = fill_form("f1040", data, str(tmp_path / "f1040.pdf"))
+
+        checked = self._checked_boxes(path)
+        assert "c1_10[0]" in checked
+        assert "c1_10[1]" not in checked
 
 
 class TestForm2555LineMath:

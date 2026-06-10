@@ -16,7 +16,11 @@ Line 11: f1_27, Line 12: f1_28, Line 13: f1_29
 Line 14: f1_30, Line 15: f1_31, Line 16: f1_32, Line 17: f1_33
 """
 
-from taxman.field_mappings.common import format_currency_for_pdf, format_ssn
+from taxman.field_mappings.common import (
+    format_currency_for_pdf,
+    format_ein,
+    format_ssn,
+)
 
 
 def build_8995_data(qbi_result, form1040_result=None, profile=None) -> dict:
@@ -43,11 +47,41 @@ def build_8995_data(qbi_result, form1040_result=None, profile=None) -> dict:
         ("f1_12[0]", "f1_13[0]", "f1_14[0]"),  # Row iv
         ("f1_15[0]", "f1_16[0]", "f1_17[0]"),  # Row v
     ]
-    if form1040_result:
-        for i, sc in enumerate(form1040_result.schedule_c_results[:5]):
-            name_f, ein_f, qbi_f = row_fields[i]
-            data[name_f] = sc.business_name
-            data[qbi_f] = format_currency_for_pdf(sc.net_profit_loss)
+    # Build rows: Schedule C businesses (QBI net of allocated adjustments,
+    # so Line 2 equals the sum of column (c)), then non-SSTB K-1s
+    rows = []
+    if qbi_result.business_qbi:
+        for i, (name, adjusted_qbi) in enumerate(qbi_result.business_qbi):
+            ein = ""
+            if profile and i < len(profile.businesses):
+                ein = profile.businesses[i].business_ein
+            if ein:
+                tin = format_ein(ein)
+            elif profile and profile.ssn:
+                tin = format_ssn(profile.ssn)
+            else:
+                tin = ""
+            rows.append((name, tin, adjusted_qbi))
+    elif form1040_result:
+        # Fallback when business_qbi wasn't populated
+        for sc in form1040_result.schedule_c_results:
+            rows.append((sc.business_name, "", sc.net_profit_loss))
+
+    if profile:
+        for k1 in profile.schedule_k1s:
+            if not k1.is_sstb and k1.qbi_amount:
+                rows.append((
+                    k1.partnership_name,
+                    format_ein(k1.partnership_ein) if k1.partnership_ein else "",
+                    k1.qbi_amount,
+                ))
+
+    for i, (name, tin, qbi_amt) in enumerate(rows[:5]):
+        name_f, ein_f, qbi_f = row_fields[i]
+        data[name_f] = name
+        if tin:
+            data[ein_f] = tin
+        data[qbi_f] = format_currency_for_pdf(qbi_amt)
 
     # f1_18: Line 2 — Total QBI
     data["f1_18[0]"] = format_currency_for_pdf(qbi_result.total_qbi)

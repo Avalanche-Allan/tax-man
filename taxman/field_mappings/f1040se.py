@@ -53,6 +53,8 @@ def build_schedule_e_data(se_result, profile=None) -> dict:
     # ── Page 1: Part I — Rental Properties (up to 3) ──
     # Property address fields
     addr_fields = ["f1_3[0]", "f1_4[0]", "f1_5[0]"]
+    # 1b: Type of property (text fields, numeric code from list below)
+    type_fields = ["f1_6[0]", "f1_7[0]", "f1_8[0]"]
     # Fair rental / personal use days
     days_fields = [
         ("f1_9[0]", "f1_10[0]"),   # A: fair rental, personal use
@@ -100,15 +102,22 @@ def build_schedule_e_data(se_result, profile=None) -> dict:
         from taxman.models import FilingStatus
         is_mfs = profile.filing_status == FilingStatus.MFS
 
+    if profile and profile.schedule_e_properties:
+        # Question A: payments requiring Form(s) 1099
+        # c1_1[0]=Yes, c1_1[1]=No; Question B (c1_2) only applies if Yes
+        if profile.made_payments_requiring_1099:
+            data["c1_1[0]"] = True
+            data["c1_2[0]"] = True  # B: will file required 1099s
+        else:
+            data["c1_1[1]"] = True
+
     if profile:
         for i, prop in enumerate(profile.schedule_e_properties[:3]):
             # Property address
             data[addr_fields[i]] = prop.property_address
 
-            # Property type code
-            type_code = _PROPERTY_TYPE_CODE.get(prop.property_type, "1")
-            # Type fields are near the address — they're small fields labeled "f" in diagnostic
-            # We skip these as they may be dropdowns not easily fillable
+            # Property type code (1b)
+            data[type_fields[i]] = _PROPERTY_TYPE_CODE.get(prop.property_type, "1")
 
             # Fair rental / personal use days
             fair_f, personal_f = days_fields[i]

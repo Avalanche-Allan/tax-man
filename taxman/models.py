@@ -538,6 +538,11 @@ class TaxpayerProfile:
     spouse_name: str = ""
     spouse_ssn: str = ""  # ITIN if applicable
     tax_year: int = 2025
+    # Form 1040 digital assets question (received, sold, or exchanged
+    # digital assets during the year)
+    received_digital_assets: bool = False
+    # Schedule E question A: made payments requiring Form(s) 1099
+    made_payments_requiring_1099: bool = False
 
     # Spouse info (for MFS)
     spouse_is_nra: bool = True
