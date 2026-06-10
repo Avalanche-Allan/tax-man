@@ -25,7 +25,10 @@ from taxman.field_mappings import (
     build_1040_data,
     build_2555_data,
     build_8995_data,
+    build_schedule_1_data,
+    build_schedule_2_data,
     build_schedule_c_data,
+    build_schedule_d_data,
     build_schedule_e_data,
     build_schedule_se_data,
 )
@@ -413,6 +416,134 @@ class TestScheduleEPartI:
         assert _parse_currency(data["f1_71[0]"]) == 6_700    # Line 21
         assert _parse_currency(data["f1_82[0]"]) == 6_700    # Line 24 income
         assert _parse_currency(data["f1_84[0]"]) == 6_700    # Line 26 total
+
+
+class TestSchedule1LineMath:
+    """Schedule 1: additional income and adjustments consistency."""
+
+    def test_line_10_matches_1040_line_8(self):
+        profile = _build_test_profile()
+        result = _build_test_result(profile)
+        data = build_schedule_1_data(result, profile)
+
+        line10 = _parse_currency(data.get("f1_38[0]", "0"))
+        assert line10 == round(result.schedule_1_income)
+
+    def test_line_26_matches_adjustments(self):
+        profile = _build_test_profile()
+        result = _build_test_result(profile)
+        data = build_schedule_1_data(result, profile)
+
+        line15 = _parse_currency(data.get("f2_05[0]", "0"))
+        line26 = _parse_currency(data.get("f2_30[0]", "0"))
+        assert line15 == round(result.schedule_se.deductible_se_tax)
+        assert line26 == round(result.adjustments)
+
+    def test_feie_on_line_8d(self):
+        """With FEIE, line 8d holds the net exclusion and line 10 nets it."""
+        from taxman.calculator import compare_feie_scenarios
+        profile = _build_test_profile()
+        profile.days_in_foreign_country_2025 = 340
+        scenarios = compare_feie_scenarios(profile)
+        result = scenarios["result_with_feie"]
+        assert result is not None
+
+        data = build_schedule_1_data(result, profile)
+        feie = result.feie
+        line_8d = _parse_currency(data.get("f1_16[0]", "0"))
+        line3 = _parse_currency(data.get("f1_07[0]", "0"))
+        line5 = _parse_currency(data.get("f1_09[0]", "0"))
+        line9 = _parse_currency(data.get("f1_37[0]", "0"))
+        line10 = _parse_currency(data.get("f1_38[0]", "0"))
+
+        assert line_8d == round(feie.net_exclusion)
+        assert line9 == -line_8d
+        # Line 10 = lines 1-7 + 9 (allow $2 for per-line rounding)
+        assert abs(line10 - (line3 + line5 + line9)) <= 2
+
+
+class TestSchedule2LineMath:
+    """Schedule 2: additional taxes consistency."""
+
+    def test_se_tax_and_total(self):
+        profile = _build_test_profile()
+        result = _build_test_result(profile)
+        data = build_schedule_2_data(result, profile)
+
+        line4 = _parse_currency(data.get("f1_15[0]", "0"))
+        line21 = _parse_currency(data.get("f2_24[0]", "0"))
+        assert line4 == round(result.se_tax)
+        expected_21 = (result.se_tax + result.early_withdrawal_penalty
+                       + result.additional_medicare + result.niit)
+        assert line21 == round(expected_21)
+
+    def test_early_withdrawal_penalty(self):
+        from taxman.models import Form1099R
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_1099_r=[Form1099R(
+                gross_distribution=10_000,
+                taxable_amount=10_000,
+                is_early_distribution=True,
+            )],
+        )
+        result = calculate_return(profile)
+        data = build_schedule_2_data(result, profile)
+
+        line8 = _parse_currency(data.get("f1_19[0]", "0"))
+        assert line8 == 1_000  # 10% of 10,000
+        assert data.get("c1_6[0]") is True  # 5329 not required
+
+
+class TestScheduleDLineMath:
+    """Schedule D: capital gains aggregation consistency."""
+
+    @staticmethod
+    def _capgain_profile():
+        from taxman.models import Form1099B
+        return TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            forms_1099_b=[Form1099B(
+                broker_name="Test Broker",
+                st_proceeds=1_000, st_cost_basis=800,
+                lt_proceeds=5_000, lt_cost_basis=3_000,
+            )],
+        )
+
+    def test_aggregate_lines(self):
+        profile = self._capgain_profile()
+        result = calculate_return(profile)
+        data = build_schedule_d_data(result.schedule_d, profile, result)
+
+        assert _parse_currency(data["f1_3[0]"]) == 1_000   # 1a (d)
+        assert _parse_currency(data["f1_4[0]"]) == 800     # 1a (e)
+        assert _parse_currency(data["f1_6[0]"]) == 200     # 1a (h)
+        assert _parse_currency(data["f1_22[0]"]) == 200    # 7
+        assert _parse_currency(data["f1_23[0]"]) == 5_000  # 8a (d)
+        assert _parse_currency(data["f1_26[0]"]) == 2_000  # 8a (h)
+        assert _parse_currency(data["f1_43[0]"]) == 2_000  # 15
+        assert _parse_currency(data["f2_1[0]"]) == 2_200   # 16
+        # QOF answered No; lines 15 & 16 both gains → 17 Yes, 20 Yes
+        assert data.get("c1_1[1]") is True
+        assert data.get("c2_1[0]") is True
+        assert data.get("c2_2[0]") is True
+
+    def test_loss_limited_on_line_21(self):
+        from taxman.models import Form1099B
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            forms_1099_b=[Form1099B(
+                broker_name="Test Broker",
+                lt_proceeds=1_000, lt_cost_basis=6_000,
+            )],
+        )
+        result = calculate_return(profile)
+        data = build_schedule_d_data(result.schedule_d, profile, result)
+
+        assert _parse_currency(data["f2_1[0]"]) == -5_000  # 16
+        # MFS loss limit $1,500 (pre-parenthesized field, positive)
+        assert _parse_currency(data["f2_4[0]"]) == 1_500   # 21
+        assert data.get("c2_3[1]") is True  # 22 No (no qualified divs)
 
 
 class TestForm1040LineMath:

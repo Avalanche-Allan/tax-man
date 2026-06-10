@@ -308,6 +308,7 @@ class Form1040Result:
     ordinary_dividends: float = 0.0    # Line 3b
     ira_distributions: float = 0.0     # Line 4a (gross) / 4b (taxable)
     capital_gain_loss: float = 0.0     # Line 7
+    schedule_1_income: float = 0.0     # Line 8 (Schedule 1, Line 10)
     total_income: float = 0.0          # Line 9
     adjustments: float = 0.0           # Line 10
     agi: float = 0.0                   # Line 11
@@ -1349,8 +1350,13 @@ def _apply_other_taxes(
     net_investment_income: float,
     fs: FilingStatus,
     lines: list[LineItem],
+    feie_addback: float = 0.0,
 ) -> None:
-    """Schedule 2 taxes: Additional Medicare Tax, NIIT, and AMT."""
+    """Schedule 2 taxes: Additional Medicare Tax, NIIT, and AMT.
+
+    feie_addback: FEIE net exclusion — §1411 MAGI for NIIT adds the
+    excluded amount back to AGI.
+    """
     # Additional Medicare Tax (Form 8959)
     # Per Form 8959: applies to combined W-2 Medicare wages + SE earnings
     # exceeding the filing-status threshold
@@ -1371,9 +1377,11 @@ def _apply_other_taxes(
                                   f"${combined_medicare_earnings:,.2f} "
                                   f"exceeds {fs.value.upper()} threshold"))
 
-    # Net Investment Income Tax (Form 8960)
+    # Net Investment Income Tax (Form 8960) — MAGI adds back FEIE exclusion
     if net_investment_income > 0:
-        result.niit = calculate_niit(net_investment_income, result.agi, fs)
+        result.niit = calculate_niit(
+            net_investment_income, result.agi + feie_addback, fs
+        )
         if result.niit > 0:
             lines.append(LineItem("Schedule 2", "18",
                                   "Net Investment Income Tax (3.8%)",
@@ -1472,11 +1480,20 @@ def _apply_payments(
                               result.amount_owed))
 
 
-def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
+def calculate_return(
+    profile: TaxpayerProfile,
+    feie: Optional[Form2555Result] = None,
+) -> Form1040Result:
     """Calculate the complete federal tax return.
 
     This is the main entry point. It computes all forms and schedules
     and produces a complete Form1040Result with every line item.
+
+    When a Form2555Result is passed (via compare_feie_scenarios), the
+    net exclusion is reported as a negative amount on Schedule 1
+    Line 8d — reducing total income, AGI, and taxable income — and
+    Line 16 tax is computed with the Foreign Earned Income Tax
+    Worksheet (stacking method). SE tax is unchanged by FEIE.
     """
     result = Form1040Result()
     lines = []
@@ -1610,6 +1627,12 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
 
     # Schedule 1 income: business + K-1 (non-investment portions) − NOL
     schedule_1_income = total_business_income + k1_other_income
+    if sch_e and k1_other_income != 0:
+        lines.append(LineItem("Schedule 1", "5",
+                              "Rental real estate, partnerships (Schedule E)",
+                              round(k1_other_income, 2),
+                              "Schedule E income excluding portions reported "
+                              "on Lines 2b/3b/7"))
 
     # NOL carryforward (Schedule 1, Line 8a — entered as negative)
     nol = profile.nol_carryforward
@@ -1620,9 +1643,19 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                               round(-nol, 2),
                               f"NOL carryforward from prior year: ${nol:,.2f}"))
 
+    # FEIE (Form 2555) — net exclusion as negative on Schedule 1 Line 8d
+    if feie and feie.net_exclusion > 0:
+        result.feie = feie
+        schedule_1_income -= feie.net_exclusion
+        lines.append(LineItem("Schedule 1", "8d",
+                              "Foreign earned income exclusion (Form 2555)",
+                              round(-feie.net_exclusion, 2),
+                              f"Form 2555 Line 45: ${feie.net_exclusion:,.2f}"))
+
+    result.schedule_1_income = round(schedule_1_income, 2)
     lines.append(LineItem("Form 1040", "8",
                           "Other income (Schedule 1)",
-                          round(schedule_1_income, 2)))
+                          result.schedule_1_income))
 
     result.total_income = round(
         wages + ira_taxable + taxable_interest + ordinary_dividends
@@ -1681,27 +1714,42 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
 
     # ─── TAX ───────────────────────────────────────────────────
     brackets = BRACKETS_BY_STATUS.get(fs, MFS_BRACKETS)
-    # Use QDCG worksheet when there are qualified dividends or net LTCG
     net_lt_for_qdcg = sch_d.net_lt_gain_loss if sch_d else 0.0
     net_st_for_qdcg = sch_d.net_st_gain_loss if sch_d else 0.0
-    if qualified_dividends > 0 or net_lt_for_qdcg > 0:
-        result.tax = calculate_tax_with_qdcg_worksheet(
-            result.taxable_income,
-            qualified_dividends,
-            net_lt_for_qdcg,
-            net_st_for_qdcg,
-            fs,
-        )
+    use_qdcg = qualified_dividends > 0 or net_lt_for_qdcg > 0
+
+    def _tax_on(taxable: float) -> float:
+        """Tax via QDCG worksheet when preferential rates apply."""
+        if use_qdcg:
+            return calculate_tax_with_qdcg_worksheet(
+                taxable, qualified_dividends,
+                net_lt_for_qdcg, net_st_for_qdcg, fs,
+            )
+        return calculate_income_tax(taxable, brackets)
+
+    if feie and feie.net_exclusion > 0:
+        # Foreign Earned Income Tax Worksheet (1040 Line 16 instructions):
+        # tax on (taxable income + exclusion) minus tax on the exclusion,
+        # so excluded income still fills the lower brackets
+        tax_plus_exclusion = _tax_on(result.taxable_income + feie.net_exclusion)
+        tax_on_exclusion = calculate_income_tax(feie.net_exclusion, brackets)
+        result.tax = round(max(tax_plus_exclusion - tax_on_exclusion, 0), 2)
+        tax_method = "Foreign Earned Income Tax Worksheet"
+    elif use_qdcg:
+        result.tax = _tax_on(result.taxable_income)
         tax_method = "QDCG worksheet"
     else:
-        result.tax = calculate_income_tax(result.taxable_income, brackets)
+        result.tax = _tax_on(result.taxable_income)
         tax_method = f"{fs.value.upper()} tax brackets"
     lines.append(LineItem("Form 1040", "16", "Tax",
                           result.tax,
                           f"From {tax_method}"))
 
     # ─── OTHER TAXES (Schedule 2) ──────────────────────────────
-    _apply_other_taxes(profile, result, net_investment_income, fs, lines)
+    _apply_other_taxes(
+        profile, result, net_investment_income, fs, lines,
+        feie_addback=feie.net_exclusion if feie else 0.0,
+    )
 
     # ─── TAX CREDITS ─────────────────────────────────────────
     refundable_actc = _apply_credits(
@@ -1751,7 +1799,13 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
 # =============================================================================
 
 def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
-    """Compare tax outcomes with and without FEIE."""
+    """Compare tax outcomes with and without FEIE.
+
+    When the exclusion is beneficial, the returned dict includes
+    "result_with_feie": a full Form1040Result recalculated with the
+    exclusion on Schedule 1 Line 8d — this is the result the forms
+    should be generated from.
+    """
     # Calculate without FEIE
     result_no_feie = calculate_return(profile)
 
@@ -1769,7 +1823,20 @@ def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
         se_deduction=result_no_feie.adjustments,
     )
 
+    # Full recalculation with the exclusion folded into the return —
+    # captures the exact QBI / worksheet / NIIT interactions and is the
+    # authoritative "with FEIE" outcome
+    result_with_feie = None
+    if feie_eval.net_exclusion > 0:
+        result_with_feie = calculate_return(profile, feie=feie_eval)
+        feie_eval.tax_with_feie = result_with_feie.tax
+        feie_eval.savings = round(
+            result_no_feie.total_tax - result_with_feie.total_tax, 2
+        )
+        feie_eval.is_beneficial = feie_eval.savings > 0
+
     return {
+        "result_with_feie": result_with_feie,
         "without_feie": {
             "income_tax": result_no_feie.tax,
             "se_tax": result_no_feie.se_tax,
@@ -1792,39 +1859,6 @@ def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
             else "Skip the FEIE — not beneficial for your situation"
         ),
     }
-
-
-def apply_feie_to_result(result: Form1040Result, feie: Form2555Result) -> None:
-    """Fold a beneficial FEIE evaluation into a completed return.
-
-    FEIE is evaluated separately from calculate_return() via
-    compare_feie_scenarios(). When the exclusion is beneficial, this
-    attaches the Form 2555 result and updates the return totals so the
-    generated Form 1040 stays consistent with the attached Form 2555.
-    SE tax is unchanged by FEIE.
-
-    Note: result.lines retains the pre-FEIE line-item breakdown; only
-    the numeric totals (tax, total_tax, overpayment/amount_owed) are
-    updated.
-    """
-    result.feie = feie
-    if not feie.is_beneficial:
-        return
-
-    result.tax = feie.tax_with_feie
-    result.total_tax = round(
-        result.tax + result.se_tax + result.additional_medicare
-        + result.niit + result.amt + result.early_withdrawal_penalty
-        - result.nonrefundable_credits, 2
-    )
-    result.total_tax = max(result.total_tax, 0)
-
-    if result.total_payments > result.total_tax:
-        result.overpayment = round(result.total_payments - result.total_tax, 2)
-        result.amount_owed = 0.0
-    else:
-        result.amount_owed = round(result.total_tax - result.total_payments, 2)
-        result.overpayment = 0.0
 
 
 def estimate_quarterly_payments(

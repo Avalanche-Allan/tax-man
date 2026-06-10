@@ -15,7 +15,6 @@ import questionary
 from rich.console import Console
 
 from taxman.calculator import (
-    apply_feie_to_result,
     calculate_return,
     compare_feie_scenarios,
     estimate_quarterly_payments,
@@ -761,11 +760,12 @@ class TaxWizard:
             scenarios = compare_feie_scenarios(self.profile)
             display_feie_comparison(scenarios)
 
-            # Persist FEIE result for PDF generation (Form 2555) and
-            # fold the reduced income tax into the return totals
+            # When beneficial, swap in the full recalculation with the
+            # exclusion on Schedule 1 Line 8d so generated forms reconcile
             feie_result = scenarios.get("feie_result")
-            if feie_result and feie_result.is_beneficial:
-                apply_feie_to_result(self.result, feie_result)
+            if (feie_result and feie_result.is_beneficial
+                    and scenarios.get("result_with_feie")):
+                self.result = scenarios["result_with_feie"]
 
         # General optimization recommendations
         console.print("\n[bold]Optimization Recommendations[/bold]")

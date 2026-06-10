@@ -22,6 +22,7 @@ IRS_FORM_URLS = {
     "f1040s2": "https://www.irs.gov/pub/irs-pdf/f1040s2.pdf",   # Schedule 2
     "f1040s3": "https://www.irs.gov/pub/irs-pdf/f1040s3.pdf",   # Schedule 3
     "f1040sc": "https://www.irs.gov/pub/irs-pdf/f1040sc.pdf",   # Schedule C
+    "f1040sd": "https://www.irs.gov/pub/irs-pdf/f1040sd.pdf",   # Schedule D
     "f1040se": "https://www.irs.gov/pub/irs-pdf/f1040se.pdf",   # Schedule E
     "f1040sse": "https://www.irs.gov/pub/irs-pdf/f1040sse.pdf", # Schedule SE
     "f2555": "https://www.irs.gov/pub/irs-pdf/f2555.pdf",       # FEIE
@@ -308,7 +309,10 @@ def generate_all_forms(
     try:
         from taxman.field_mappings import (
             build_1040_data,
+            build_schedule_1_data,
+            build_schedule_2_data,
             build_schedule_c_data,
+            build_schedule_d_data,
             build_schedule_e_data,
             build_schedule_se_data,
             build_8995_data,
@@ -324,12 +328,29 @@ def generate_all_forms(
          lambda: build_1040_data(result, profile)),
     ]
 
+    # Schedule 1 — required when there's additional income or adjustments
+    if result.schedule_1_income != 0 or result.adjustments > 0:
+        specs.append(("Schedule 1", "f1040s1", "schedule_1",
+                      lambda: build_schedule_1_data(result, profile)))
+
+    # Schedule 2 — required for SE tax, AMT, or other additional taxes
+    if (result.se_tax > 0 or result.amt > 0 or result.additional_medicare > 0
+            or result.niit > 0 or result.early_withdrawal_penalty > 0):
+        specs.append(("Schedule 2", "f1040s2", "schedule_2",
+                      lambda: build_schedule_2_data(result, profile)))
+
     for i, sc_result in enumerate(result.schedule_c_results):
         biz = profile.businesses[i] if i < len(profile.businesses) else None
         specs.append((
             f"Schedule C #{i+1}", "f1040sc", f"schedule_c_{i+1}",
             lambda sc=sc_result, b=biz: build_schedule_c_data(sc, b, profile),
         ))
+
+    # Schedule D — required when there's capital gain/loss activity
+    if result.schedule_d:
+        specs.append(("Schedule D", "f1040sd", "schedule_d",
+                      lambda: build_schedule_d_data(
+                          result.schedule_d, profile, result)))
 
     if result.schedule_se and result.schedule_se.se_tax > 0:
         specs.append(("Schedule SE", "f1040sse", "schedule_se",

@@ -1785,9 +1785,9 @@ class TestFEIEIntegration:
         scenarios = compare_feie_scenarios(profile)
         assert isinstance(scenarios["feie_result"], Form2555Result)
 
-    def test_apply_feie_updates_totals(self):
-        """apply_feie_to_result folds reduced tax into return totals."""
-        from taxman.calculator import apply_feie_to_result
+    def test_result_with_feie_reconciles(self):
+        """The FEIE recalculation shows the exclusion on Schedule 1 8d
+        and reduces income totals consistently."""
         profile = TaxpayerProfile(
             filing_status=FilingStatus.MFS,
             days_in_foreign_country_2025=340,
@@ -1796,43 +1796,54 @@ class TestFEIEIntegration:
                 gross_receipts=120_000,
             )],
         )
-        result = calculate_return(profile)
-        feie = compare_feie_scenarios(profile)["feie_result"]
+        no_feie = calculate_return(profile)
+        scenarios = compare_feie_scenarios(profile)
+        feie = scenarios["feie_result"]
+        with_feie = scenarios["result_with_feie"]
+
         assert feie.is_beneficial
+        assert with_feie is not None
+        assert with_feie.feie is feie
 
-        apply_feie_to_result(result, feie)
+        # Schedule 1 Line 8d carries the negative net exclusion
+        line_8d = next(
+            (l for l in with_feie.lines
+             if l.form == "Schedule 1" and l.line == "8d"), None)
+        assert line_8d is not None
+        assert line_8d.amount == pytest.approx(-feie.net_exclusion, abs=0.01)
 
-        assert result.feie is feie
-        assert result.tax == feie.tax_with_feie
-        # Total tax recomputed from the FEIE income tax; SE tax unchanged
+        # Income totals reduced by exactly the net exclusion
+        assert with_feie.total_income == pytest.approx(
+            no_feie.total_income - feie.net_exclusion, abs=0.02)
+        assert with_feie.agi == pytest.approx(
+            no_feie.agi - feie.net_exclusion, abs=0.02)
+
+        # SE tax unchanged by FEIE; income tax reduced
+        assert with_feie.se_tax == no_feie.se_tax
+        assert with_feie.tax <= no_feie.tax
+        assert feie.tax_with_feie == with_feie.tax
+
+        # Totals self-consistent
         expected_total = max(round(
-            feie.tax_with_feie + result.se_tax + result.additional_medicare
-            + result.niit + result.amt + result.early_withdrawal_penalty
-            - result.nonrefundable_credits, 2), 0)
-        assert result.total_tax == expected_total
-        assert result.amount_owed == round(
-            result.total_tax - result.total_payments, 2)
+            with_feie.tax + with_feie.se_tax + with_feie.additional_medicare
+            + with_feie.niit + with_feie.amt
+            + with_feie.early_withdrawal_penalty
+            - with_feie.nonrefundable_credits, 2), 0)
+        assert with_feie.total_tax == expected_total
 
-    def test_apply_feie_not_beneficial_keeps_totals(self):
-        """A non-beneficial FEIE attaches the form but leaves totals alone."""
-        from taxman.calculator import apply_feie_to_result
+    def test_no_feie_result_when_not_qualified(self):
+        """Under 330 days abroad → no exclusion, no result_with_feie."""
         profile = TaxpayerProfile(
             filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=100,
             businesses=[ScheduleCData(
                 business_name="Consulting",
                 gross_receipts=80_000,
             )],
         )
-        result = calculate_return(profile)
-        original_tax = result.tax
-        original_total = result.total_tax
-
-        feie = Form2555Result(is_beneficial=False, tax_with_feie=0.0)
-        apply_feie_to_result(result, feie)
-
-        assert result.feie is feie
-        assert result.tax == original_tax
-        assert result.total_tax == original_total
+        scenarios = compare_feie_scenarios(profile)
+        assert scenarios["result_with_feie"] is None
+        assert not scenarios["feie_result"].is_beneficial
 
 
 # =============================================================================

@@ -136,12 +136,9 @@ def build_1040_data(result, profile) -> dict:
     # f1_70: Line 7a — Capital gain or (loss)
     if result.capital_gain_loss != 0:
         data["f1_70[0]"] = format_currency_for_pdf(result.capital_gain_loss)
-    # f1_72: Line 8 — Additional income from Schedule 1
-    sched1_income = (result.total_income - result.wage_income
-                     - result.taxable_interest - result.ordinary_dividends
-                     - result.capital_gain_loss - result.ira_distributions)
-    if sched1_income != 0:
-        data["f1_72[0]"] = format_currency_for_pdf(sched1_income)
+    # f1_72: Line 8 — Additional income from Schedule 1, Line 10
+    if result.schedule_1_income != 0:
+        data["f1_72[0]"] = format_currency_for_pdf(result.schedule_1_income)
     # f1_73: Line 9 — Total income
     data["f1_73[0]"] = format_currency_for_pdf(result.total_income)
     # f1_74: Line 10 — Adjustments to income (Schedule 1)
@@ -162,10 +159,10 @@ def build_1040_data(result, profile) -> dict:
     # f2_05: Line 14 — Total deductions (12e + 13a + 13b)
     total_deductions = result.deduction + result.qbi_deduction
     data["f2_05[0]"] = format_currency_for_pdf(total_deductions)
-    # f2_06: Line 15 — Taxable income
-    data["f2_06[0]"] = format_currency_for_pdf(result.taxable_income)
+    # f2_06: Line 15 — Taxable income ("enter -0-" if zero per IRS)
+    data["f2_06[0]"] = format_currency_for_pdf(result.taxable_income) or "0"
     # f2_08: Line 16 — Tax
-    data["f2_08[0]"] = format_currency_for_pdf(result.tax)
+    data["f2_08[0]"] = format_currency_for_pdf(result.tax) or "0"
     # f2_09: Line 17 — Amount from Schedule 2, line 3 (AMT + excess premium tax credit)
     if result.amt > 0:
         data["f2_09[0]"] = format_currency_for_pdf(result.amt)
@@ -180,7 +177,7 @@ def build_1040_data(result, profile) -> dict:
         data["f2_13[0]"] = format_currency_for_pdf(result.nonrefundable_credits)
     # f2_14: Line 22 — Subtract line 21 from line 18
     tax_less_credits = max(result.tax + result.amt - result.nonrefundable_credits, 0)
-    data["f2_14[0]"] = format_currency_for_pdf(tax_less_credits)
+    data["f2_14[0]"] = format_currency_for_pdf(tax_less_credits) or "0"
     # f2_15: Line 23 — Other taxes (SE tax, Addl Medicare, NIIT from Schedule 2)
     other_taxes = result.se_tax + result.additional_medicare + result.niit + result.early_withdrawal_penalty
     data["f2_15[0]"] = format_currency_for_pdf(other_taxes)
@@ -202,7 +199,7 @@ def build_1040_data(result, profile) -> dict:
 
     # f2_28: Line 32 — Total other payments and refundable credits
     # f2_29: Line 33 — Total payments
-    data["f2_29[0]"] = format_currency_for_pdf(result.total_payments)
+    data["f2_29[0]"] = format_currency_for_pdf(result.total_payments) or "0"
 
     # Refund / amount owed
     if result.overpayment > 0:
@@ -215,5 +212,14 @@ def build_1040_data(result, profile) -> dict:
         data["f2_35[0]"] = format_currency_for_pdf(result.amount_owed)
 
     # Note: f2_22 is "former spouse SSN for estimated tax" — no page 2 SSN header exists
+
+    # ── Sign Here block ──
+    # f2_40: Your occupation, f2_44: Phone no., f2_45: Email address
+    if profile.occupation:
+        data["f2_40[0]"] = profile.occupation
+    if profile.phone:
+        data["f2_44[0]"] = profile.phone
+    if profile.email:
+        data["f2_45[0]"] = profile.email
 
     return data

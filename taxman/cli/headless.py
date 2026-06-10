@@ -1051,7 +1051,6 @@ def _process_calculate(session: SessionState, profile: TaxpayerProfile, answers:
 
 def _process_optimization(session: SessionState, profile: TaxpayerProfile, answers: dict) -> dict:
     from taxman.calculator import (
-        apply_feie_to_result,
         compare_feie_scenarios,
         generate_optimization_recommendations,
     )
@@ -1073,8 +1072,9 @@ def _process_optimization(session: SessionState, profile: TaxpayerProfile, answe
         }
 
         feie_result = scenarios.get("feie_result")
-        if feie_result and feie_result.is_beneficial:
-            apply_feie_to_result(result, feie_result)
+        if (feie_result and feie_result.is_beneficial
+                and scenarios.get("result_with_feie")):
+            result = scenarios["result_with_feie"]
             session.results = serialize_result(result)
             session.save()
 
