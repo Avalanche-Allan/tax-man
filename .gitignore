@@ -8,6 +8,9 @@ forms/
 returns-2023/
 returns-2024/
 data-2025/
+payments-2026/*
+!payments-2026/README.md
+!payments-2026/.gitkeep
 
 # One-off scripts with personal financial data
 generate_dated_return.py
