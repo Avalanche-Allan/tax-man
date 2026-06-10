@@ -10,6 +10,12 @@ OBBBA made TCJA rates permanent and increased the standard deduction.
 Bracket thresholds from Rev. Proc. 2024-40 remain unchanged by OBBBA.
 """
 
+# The tax year this engine's constants and form mappings target.
+# Bumping this requires the full rollover checklist
+# (docs/rollover-2026.md): every dollar constant in this file AND
+# re-verification of every field mapping against the new-year PDFs.
+TAX_YEAR = 2025
+
 # =============================================================================
 # TAX BRACKETS - Married Filing Separately (2025)
 # Source: Rev. Proc. 2024-40, §3.01 (MFS = half of MFJ thresholds)

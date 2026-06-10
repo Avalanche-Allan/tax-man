@@ -286,5 +286,64 @@ def sessions():
     console.print(table)
 
 
+@app.command()
+def rollover(
+    session_id: str = typer.Argument(..., help="Completed session to roll forward"),
+):
+    """Roll a completed year's session forward to the next tax year.
+
+    Creates a NEW session with recurring structures kept (businesses,
+    rental, identity), year-specific documents cleared, and the
+    completed year's total tax recorded for safe-harbor estimates.
+    """
+    from taxman.calculator import estimate_quarterly_payments
+    from taxman.cli.serialization import (
+        deserialize_profile,
+        deserialize_result,
+        serialize_profile,
+    )
+    from taxman.cli.state import SessionState
+    from taxman.rollover import rollover_profile
+
+    session = SessionState.load(session_id)
+    if not session or not session.profile_data:
+        console.print(f"[red]Session {session_id} not found or has no profile.[/red]")
+        raise typer.Exit(1)
+    if not session.results:
+        console.print(f"[red]Session {session_id} has no calculated results — "
+                      f"run the return first so prior-year tax is known.[/red]")
+        raise typer.Exit(1)
+
+    profile = deserialize_profile(session.profile_data)
+    result = deserialize_result(session.results)
+
+    new_profile = rollover_profile(profile, result.total_tax)
+
+    new_session = SessionState.create()
+    new_session.filing_status = new_profile.filing_status.value
+    new_session.profile_data = serialize_profile(new_profile)
+    new_session.save()
+
+    estimates = estimate_quarterly_payments(
+        total_tax=result.total_tax,          # proxy: assume a similar year
+        prior_year_tax=result.total_tax,
+        agi=result.agi,
+        filing_status=new_profile.filing_status,
+    )
+
+    console.print(f"\n[bold green]Rolled {profile.tax_year} session forward "
+                  f"to {new_profile.tax_year}.[/bold green]")
+    console.print(f"New session: [bold]{new_session.session_id}[/bold]")
+    console.print(f"Prior-year tax (safe harbor basis): "
+                  f"${new_profile.prior_year_tax:,.2f}")
+    console.print(f"\n[bold]{new_profile.tax_year} estimated payments[/bold]")
+    console.print(f"  Safe harbor (100% of {profile.tax_year} tax): "
+                  f"${estimates['safe_harbor_prior_year']:,.2f}/yr → "
+                  f"${estimates['safe_harbor_prior_year'] / 4:,.2f}/quarter")
+    console.print("  Due dates: Apr 15 / Jun 15 / Sep 15 / Jan 15")
+    console.print(f"\nResume anytime with: taxman prepare --resume "
+                  f"{new_session.session_id}")
+
+
 if __name__ == "__main__":
     app()

@@ -1002,6 +1002,47 @@ class TestFilingPacketAssembly:
         doc.close()
 
 
+class TestFormVintage:
+    """Cached PDFs must match the engine's TAX_YEAR.
+
+    IRS form URLs are versionless — irs.gov swaps in the new revision
+    at the same URL each year, and field positions shift between
+    revisions (the 2025 f1040 moved the filing-status checkboxes,
+    which made every generated return check the "Deceased" box).
+    These tests fail loudly when a cached form is from a different
+    year than the constants and mappings target, forcing the rollover
+    checklist (docs/rollover-2026.md) instead of silent corruption.
+    """
+
+    # Forms whose page-1 text contains the tax year
+    _YEAR_STAMPED = [
+        "f1040", "f1040s1", "f1040s2", "f1040sc", "f1040sd",
+        "f1040se", "f1040sse", "f2555", "f8995",
+        "dr0104", "dr0104pn",
+    ]
+
+    @_skip_no_forms
+    @pytest.mark.parametrize("form_key", _YEAR_STAMPED)
+    def test_cached_form_matches_tax_year(self, form_key):
+        import fitz
+        from taxman.constants import TAX_YEAR
+        from taxman.fill_forms import FORMS_DIR
+
+        pdf_path = FORMS_DIR / f"{form_key}.pdf"
+        if not pdf_path.exists():
+            pytest.skip(f"{form_key}.pdf not downloaded")
+
+        doc = fitz.open(str(pdf_path))
+        page1 = doc[0].get_text()
+        doc.close()
+        assert str(TAX_YEAR) in page1, (
+            f"{form_key}.pdf does not mention {TAX_YEAR} on page 1 — "
+            f"a new-year revision was likely downloaded. All field "
+            f"mappings must be re-verified before generating returns "
+            f"(see docs/rollover-2026.md)."
+        )
+
+
 # =============================================================================
 # Fix 5: No Guessed Field Mappings
 # =============================================================================
