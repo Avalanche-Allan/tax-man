@@ -14,6 +14,7 @@ from taxman.field_mappings.f1040se import build_schedule_e_data
 from taxman.field_mappings.f1040sse import build_schedule_se_data
 from taxman.field_mappings.f8995 import build_8995_data
 from taxman.field_mappings.f2555 import build_2555_data
+from taxman.field_mappings.dr0104 import build_dr0104_data, build_dr0104pn_data
 
 __all__ = [
     "build_1040_data",
@@ -25,4 +26,6 @@ __all__ = [
     "build_schedule_se_data",
     "build_8995_data",
     "build_2555_data",
+    "build_dr0104_data",
+    "build_dr0104pn_data",
 ]

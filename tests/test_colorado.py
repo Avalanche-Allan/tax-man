@@ -62,6 +62,44 @@ class TestCalculateCOSourceIncome:
         )
         assert calculate_co_source_income(profile) == -3_000.0
 
+    def test_direct_co_rental_property(self):
+        """Directly owned CO rental (Schedule E Part I) is CO-source."""
+        from taxman.models import ScheduleEProperty
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="2075 Jamaica St, Aurora, CO 80010",
+                gross_rents=20_000,
+                mortgage_interest=5_000,
+                taxes=2_000,
+            )],
+        )
+        assert calculate_co_source_income(profile) == 13_000
+
+    def test_non_co_rental_excluded(self):
+        from taxman.models import ScheduleEProperty
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="1 Main St, Austin, TX 78701",
+                gross_rents=20_000,
+            )],
+        )
+        assert calculate_co_source_income(profile) == 0
+
+    def test_co_rental_loss_suspended_for_mfs(self):
+        """MFS passive-loss suspension mirrors the federal treatment."""
+        from taxman.models import ScheduleEProperty
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="2075 Jamaica St, Aurora, CO 80010",
+                gross_rents=5_000,
+                mortgage_interest=9_000,
+            )],
+        )
+        assert calculate_co_source_income(profile) == 0
+
 
 class TestCalculateColorado104:
     def test_nonresident_apportionment(self, co_profile):
@@ -81,10 +119,12 @@ class TestCalculateColorado104:
         federal = calculate_return(co_profile)
         co = calculate_colorado_104(federal, co_profile)
 
-        # CO source / total income
+        # DR 0104PN method: modified CO AGI / modified federal AGI
         co_source = calculate_co_source_income(co_profile)
-        expected_pct = co_source / federal.total_income
+        expected_pct = min(max(co_source / federal.agi, 0), 1.0)
         assert abs(co.apportionment_pct - expected_pct) < 0.001
+        assert co.federal_modified_agi == federal.agi
+        assert co.co_modified_agi == co_source
 
     def test_override_co_source(self, co_profile):
         federal = calculate_return(co_profile)

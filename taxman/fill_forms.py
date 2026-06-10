@@ -28,6 +28,17 @@ IRS_FORM_URLS = {
     "f2555": "https://www.irs.gov/pub/irs-pdf/f2555.pdf",       # FEIE
     "f8995": "https://www.irs.gov/pub/irs-pdf/f8995.pdf",       # QBI simplified
     "f8995a": "https://www.irs.gov/pub/irs-pdf/f8995a.pdf",     # QBI full
+    # Colorado Department of Revenue (2025 tax year)
+    "dr0104": "https://tax.colorado.gov/sites/tax/files/documents/DR0104_2025.pdf",
+    "dr0104pn": "https://tax.colorado.gov/sites/tax/files/documents/DR0104PN_2025.pdf",
+}
+
+# tax.colorado.gov rejects urllib's default user agent
+_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+    ),
 }
 
 # Bug 7 fix: Use package-relative path with env var override
@@ -124,7 +135,10 @@ def download_irs_form(form_key: str, force: bool = False) -> Path:
     # partial file that later runs would treat as a valid cached PDF
     tmp_path = output_path.with_suffix(".pdf.download")
     try:
-        urllib.request.urlretrieve(url, tmp_path)
+        request = urllib.request.Request(url, headers=_DOWNLOAD_HEADERS)
+        with urllib.request.urlopen(request) as response, \
+                open(tmp_path, "wb") as f:
+            shutil.copyfileobj(response, f)
     except OSError as e:
         tmp_path.unlink(missing_ok=True)
         raise RuntimeError(
@@ -217,15 +231,28 @@ def _apply_qualified_fields(pdf_bytes: bytes, values: dict) -> bytes:
     return out
 
 
+_WIDGET_PREFIX = "widget:"
+
+
 def _split_field_data(form_key: str, data: dict) -> tuple:
     """Split field data into (PyPDFForm bytes-or-path source, short-name dict).
 
-    Keys containing '.' are fully-qualified names pre-applied to the
-    source PDF via pymupdf; the rest go through PyPDFForm.
+    Two kinds of keys are pre-applied to the source PDF via pymupdf
+    (_apply_qualified_fields); the rest go through PyPDFForm:
+    - keys containing '.' — fully-qualified names for ambiguous fields
+    - keys prefixed 'widget:' — fields PyPDFForm cannot set, e.g. the
+      Colorado DR 0104 "RB*" buttons whose only state is the on-state
     """
     pdf_path = download_irs_form(form_key)
-    qualified = {k: v for k, v in data.items() if "." in k}
-    simple = {k: v for k, v in data.items() if "." not in k}
+    qualified = {}
+    simple = {}
+    for k, v in data.items():
+        if k.startswith(_WIDGET_PREFIX):
+            qualified[k[len(_WIDGET_PREFIX):]] = v
+        elif "." in k:
+            qualified[k] = v
+        else:
+            simple[k] = v
 
     if qualified:
         source = _apply_qualified_fields(pdf_path.read_bytes(), qualified)
@@ -369,6 +396,22 @@ def generate_all_forms(
     if result.feie and result.feie.is_beneficial:
         specs.append(("Form 2555", "f2555", "f2555",
                       lambda: build_2555_data(result.feie, profile)))
+
+    # Colorado DR 0104 (+ DR 0104PN for nonresidents)
+    if profile and getattr(profile, "has_colorado_filing_obligation", False):
+        from taxman.colorado import calculate_colorado_104
+        from taxman.field_mappings import (
+            build_dr0104_data,
+            build_dr0104pn_data,
+        )
+        co_result = calculate_colorado_104(result, profile)
+        specs.append(("Colorado DR 0104", "dr0104", "co_dr0104",
+                      lambda: build_dr0104_data(co_result, result, profile)))
+        if co_result.is_nonresident:
+            specs.append((
+                "Colorado DR 0104PN", "dr0104pn", "co_dr0104pn",
+                lambda: build_dr0104pn_data(co_result, result, profile),
+            ))
 
     for description, form_key, basename, build_data in specs:
         try:

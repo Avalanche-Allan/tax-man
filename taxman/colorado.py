@@ -7,6 +7,7 @@ For this profile: CO-source income comes from K-1 rental property
 located in Denver.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -28,17 +29,31 @@ class ColoradoForm104Result:
     co_subtractions: float = 0.0
     co_taxable_income: float = 0.0
     co_source_income: float = 0.0
-    apportionment_pct: float = 0.0  # CO source / total income
+    # DR 0104PN lines 32/33: apportionment numerator and denominator
+    federal_modified_agi: float = 0.0   # PN line 32
+    co_modified_agi: float = 0.0        # PN line 33
+    apportionment_pct: float = 0.0      # PN line 34 (CO AGI / federal AGI)
     co_tax_before_apportion: float = 0.0
     co_tax: float = 0.0
     is_nonresident: bool = True
     lines: list[LineItem] = field(default_factory=list)
 
 
+_STATE_IN_ADDRESS = re.compile(r",\s*([A-Z]{2})\s+\d{5}")
+
+
+def _property_state(address: str) -> str:
+    """Extract the two-letter state from 'street, City, ST 12345'."""
+    m = _STATE_IN_ADDRESS.search(address or "")
+    return m.group(1) if m else ""
+
+
 def calculate_co_source_income(profile: TaxpayerProfile) -> float:
     """Calculate Colorado-source income.
 
     For nonresidents, CO-source income includes:
+    - Net rental income from directly owned CO real property
+      (Schedule E Part I — property state detected from the address)
     - Rental income from CO property (K-1 Box 2 from CO partnerships)
     - Ordinary business income from CO partnerships
     - Guaranteed payments from CO partnerships
@@ -48,6 +63,17 @@ def calculate_co_source_income(profile: TaxpayerProfile) -> float:
     is CO-source. The user should flag which K-1s are from CO.
     """
     co_source = 0.0
+
+    # Direct rental properties located in Colorado
+    is_mfs = profile.filing_status == FilingStatus.MFS
+    for prop in profile.schedule_e_properties:
+        if _property_state(prop.property_address) != "CO":
+            continue
+        net = prop.net_income
+        if net < 0 and is_mfs:
+            # Mirror the federal MFS passive-loss suspension
+            net = 0.0
+        co_source += net
 
     for k1 in profile.schedule_k1s:
         # Treat all K-1 income as CO-source if it's from a CO partnership
@@ -140,33 +166,42 @@ def calculate_colorado_104(
     is_nonresident = profile.foreign_address or profile.state != "CO"
     result.is_nonresident = is_nonresident
 
-    if is_nonresident and federal_result.total_income > 0:
+    if is_nonresident:
         # Calculate CO-source income
         if co_source_income is not None:
             result.co_source_income = co_source_income
         else:
             result.co_source_income = calculate_co_source_income(profile)
 
-        # Apportionment percentage
-        result.apportionment_pct = min(
-            max(result.co_source_income / federal_result.total_income, 0), 1.0
-        )
-        lines.append(LineItem("CO Form 104-PN", "36",
-                              "CO source income",
-                              round(result.co_source_income, 2),
+        # DR 0104PN method (lines 32-34): apportionment percentage is
+        # modified Colorado AGI / modified federal AGI. CO adjustments
+        # are 0 here (SE income is not CO-source for this profile), so
+        # CO modified AGI == CO-source income.
+        result.federal_modified_agi = federal_result.agi
+        result.co_modified_agi = result.co_source_income
+        if result.federal_modified_agi > 0:
+            result.apportionment_pct = min(
+                max(result.co_modified_agi / result.federal_modified_agi, 0),
+                1.0,
+            )
+        else:
+            result.apportionment_pct = 0.0
+        lines.append(LineItem("CO Form 104-PN", "33",
+                              "Modified Colorado AGI",
+                              round(result.co_modified_agi, 2),
                               "Income sourced to Colorado"))
-        lines.append(LineItem("CO Form 104-PN", "37",
+        lines.append(LineItem("CO Form 104-PN", "34",
                               "Apportionment percentage",
-                              round(result.apportionment_pct * 100, 2),
-                              f"CO source / total income: "
-                              f"${result.co_source_income:,.2f} / "
-                              f"${federal_result.total_income:,.2f}"))
+                              round(result.apportionment_pct * 100, 4),
+                              f"CO modified AGI / federal modified AGI: "
+                              f"${result.co_modified_agi:,.2f} / "
+                              f"${result.federal_modified_agi:,.2f}"))
 
-        # Apportioned tax
+        # Apportioned tax (PN line 36 → DR 0104 line 13)
         result.co_tax = round(
             result.co_tax_before_apportion * result.apportionment_pct, 2
         )
-        lines.append(LineItem("CO Form 104", "7",
+        lines.append(LineItem("CO Form 104", "13",
                               "Colorado tax (apportioned)",
                               result.co_tax,
                               f"${result.co_tax_before_apportion:,.2f} × "

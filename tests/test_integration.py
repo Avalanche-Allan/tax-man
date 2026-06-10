@@ -406,9 +406,11 @@ class TestFormsDir:
 
 
 class TestIRSFormURLs:
-    def test_all_urls_are_irs(self):
+    def test_all_urls_are_official(self):
         for key, url in IRS_FORM_URLS.items():
-            assert url.startswith("https://www.irs.gov/"), f"{key} URL invalid"
+            assert url.startswith(
+                ("https://www.irs.gov/", "https://tax.colorado.gov/")
+            ), f"{key} URL invalid"
 
     def test_required_forms_present(self):
         required = ["f1040", "f1040sc", "f1040se", "f1040sse", "f2555", "f8995"]

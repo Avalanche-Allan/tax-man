@@ -819,6 +819,88 @@ class TestGoldenFileSnapshots:
         assert Path(output_path).stat().st_size > 10_000
 
 
+class TestColoradoDR0104:
+    """Colorado DR 0104 / DR 0104PN field mapping consistency."""
+
+    @staticmethod
+    def _co_profile():
+        from taxman.models import ScheduleEProperty
+        return TaxpayerProfile(
+            first_name="Test",
+            last_name="User",
+            ssn="123-45-6789",
+            filing_status=FilingStatus.MFS,
+            foreign_address=True,
+            country="Mexico",
+            has_colorado_filing_obligation=True,
+            businesses=[ScheduleCData(
+                business_name="Consulting",
+                gross_receipts=80_000,
+            )],
+            schedule_e_properties=[ScheduleEProperty(
+                property_address="100 Test St, Denver, CO 80202",
+                gross_rents=20_000,
+                mortgage_interest=5_000,
+            )],
+        )
+
+    def test_dr0104_line_consistency(self):
+        from taxman.colorado import calculate_colorado_104
+        from taxman.field_mappings import build_dr0104_data
+        profile = self._co_profile()
+        result = calculate_return(profile)
+        co = calculate_colorado_104(result, profile)
+        data = build_dr0104_data(co, result, profile)
+
+        assert data["widget:RB2"] is True   # nonresident
+        assert data["widget:RB3"] is True   # abroad on due date
+        assert _parse_currency(data["Form Question 1"]) == round(
+            co.federal_taxable_income)
+        assert _parse_currency(data["Form Question 12"]) == round(
+            co.co_taxable_income)
+        assert _parse_currency(data["Form Question 13"]) == round(co.co_tax)
+        # No withholding → amount owed equals the tax
+        assert _parse_currency(data["Form Question 47"]) == round(co.co_tax)
+
+    def test_dr0104pn_apportionment(self):
+        from taxman.colorado import calculate_colorado_104
+        from taxman.field_mappings import build_dr0104pn_data
+        profile = self._co_profile()
+        result = calculate_return(profile)
+        co = calculate_colorado_104(result, profile)
+        data = build_dr0104pn_data(co, result, profile)
+
+        assert data["widget:RB1"] is True   # full-year nonresident
+        assert data["widget:RB9"] is True   # filed federal 1040
+        # Federal column reconciles with the federal return
+        assert _parse_currency(data["Federal Infomation Line 20"]) == round(
+            result.total_income)
+        assert _parse_currency(data["Federal Infomation Line 24"]) == round(
+            result.agi)
+        # CO column: rental on line 17 flows to lines 21/25/33
+        co_income = round(co.co_source_income)
+        assert _parse_currency(data["Colorado Information Line 17"]) == co_income
+        assert _parse_currency(data["Colorado Information Line 33"]) == co_income
+        # Line 34 percentage matches the engine (xxx.xxxx format)
+        assert data["Federal Infomation Line 34"] == (
+            f"{co.apportionment_pct * 100:.4f}")
+        # Line 36 = DR 0104 line 13
+        assert _parse_currency(data["Federal Infomation Line 36"]) == round(
+            co.co_tax)
+
+    def test_full_year_resident_no_pn(self):
+        from taxman.colorado import calculate_colorado_104
+        from taxman.field_mappings import build_dr0104_data
+        profile = self._co_profile()
+        profile.foreign_address = False
+        profile.state = "CO"
+        result = calculate_return(profile)
+        co = calculate_colorado_104(result, profile)
+        data = build_dr0104_data(co, result, profile)
+        assert data["widget:RB1"] is True
+        assert "widget:RB2" not in data
+
+
 # =============================================================================
 # generate_all_forms orchestration
 # =============================================================================
