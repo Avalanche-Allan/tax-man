@@ -5,14 +5,18 @@ repos/
 forms/
 
 # Sensitive tax documents
-returns-2023/*.pdf
-returns-2024/*.pdf
+returns-2023/
+returns-2024/
 data-2025/
+
+# One-off scripts with personal financial data
+generate_dated_return.py
 
 # Generated output
 output/
 
 # Python
+.venv/
 __pycache__/
 *.pyc
 *.pyo
@@ -20,6 +24,9 @@ __pycache__/
 dist/
 build/
 .eggs/
+
+# macOS
+.DS_Store
 
 # Keep directory structure
 !returns-2023/.gitkeep

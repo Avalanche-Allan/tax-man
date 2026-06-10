@@ -206,6 +206,7 @@ class ScheduleSEResult:
     """Calculated Schedule SE."""
     net_se_earnings: float = 0.0       # Line 3
     taxable_se_earnings: float = 0.0   # Line 4 (92.35% of net)
+    w2_ss_wages: float = 0.0          # Line 8a (W-2 SS wages)
     se_tax: float = 0.0               # Line 12
     deductible_se_tax: float = 0.0    # 50% of SE tax
     lines: list[LineItem] = field(default_factory=list)
@@ -465,6 +466,7 @@ def calculate_schedule_se(
     lines = []
 
     result.net_se_earnings = net_se_income
+    result.w2_ss_wages = w2_ss_wages
     lines.append(LineItem("Schedule SE", "3", "Net SE earnings",
                           round(net_se_income, 2),
                           "Combined net profit from Schedule C + K-1 SE earnings"))
@@ -755,6 +757,7 @@ def calculate_qbi_deduction(
     k1_w2_wages: float = 0.0,
     k1_ubia: float = 0.0,
     net_capital_gain: float = 0.0,
+    business_adjustments: float = 0.0,
 ) -> Form8995Result:
     """Calculate QBI deduction (Form 8995/8995-A).
 
@@ -765,11 +768,18 @@ def calculate_qbi_deduction(
     Above threshold: W-2 wage / capital limitations apply (Form 8995-A).
 
     QBI sources: Schedule C net profit + K-1 Box 20 Code Z (non-SSTB).
+
+    business_adjustments (deductible SE tax, SE health insurance, SE
+    retirement contributions) reduce Schedule C QBI only — K-1 QBI is
+    reported net of partnership-level adjustments. If K-1 Box 14 SE
+    earnings exist, the SE-tax portion allocable to them is not split
+    out here (treated as fully allocable to Schedule C).
     """
     result = Form8995Result()
     lines = []
 
     schedule_c_qbi = sum(r.net_profit_loss for r in schedule_c_results)
+    schedule_c_qbi -= business_adjustments
     total_qbi = schedule_c_qbi + k1_qbi
     total_w2_wages = w2_wages + k1_w2_wages
     total_ubia = ubia + k1_ubia
@@ -778,6 +788,11 @@ def calculate_qbi_deduction(
     qbi_source = "Schedule C businesses"
     if k1_qbi > 0:
         qbi_source += f" + K-1 QBI (${k1_qbi:,.2f})"
+    if business_adjustments > 0:
+        qbi_source += (
+            f", reduced by allocable adjustments "
+            f"(${business_adjustments:,.2f})"
+        )
     lines.append(LineItem("Form 8995", "1-3",
                           "Total qualified business income",
                           round(total_qbi, 2),
@@ -1235,18 +1250,13 @@ def evaluate_feie(
 # Master Calculation — Builds the Full Return
 # =============================================================================
 
-def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
-    """Calculate the complete federal tax return.
+def _apply_schedule_c(
+    profile: TaxpayerProfile, result: Form1040Result, lines: list[LineItem]
+) -> float:
+    """Compute Schedule C for each business and return total business income.
 
-    This is the main entry point. It computes all forms and schedules
-    and produces a complete Form1040Result with every line item.
+    Auto-creates a Schedule C from 1099-NEC forms if no businesses defined.
     """
-    result = Form1040Result()
-    lines = []
-    fs = profile.filing_status
-
-    # ─── SCHEDULE C (for each business) ─────────────────────────
-    # Auto-create Schedule C from 1099-NEC if no businesses defined
     businesses = list(profile.businesses)
     if not businesses and profile.forms_1099_nec:
         nec_total = sum(f.nonemployee_compensation for f in profile.forms_1099_nec)
@@ -1265,6 +1275,199 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                               f"Business income: {biz.business_name}",
                               sc.net_profit_loss,
                               "From Schedule C, Line 31"))
+    return total_business_income
+
+
+def _apply_adjustments(
+    profile: TaxpayerProfile,
+    result: Form1040Result,
+    total_business_income: float,
+    lines: list[LineItem],
+) -> float:
+    """Schedule 1 Part II adjustments to income.
+
+    Sets result.adjustments and returns the portion allocable to
+    Schedule C QBI (deductible SE tax + SE health insurance).
+    """
+    adjustments = 0.0
+    qbi_business_adjustments = 0.0
+
+    # Deductible half of SE tax
+    if result.schedule_se:
+        adj_se = result.schedule_se.deductible_se_tax
+        adjustments += adj_se
+        qbi_business_adjustments += adj_se
+        lines.append(LineItem("Schedule 1", "15",
+                              "Deductible part of self-employment tax",
+                              adj_se))
+
+    # Self-employed health insurance deduction
+    # Per Form 7206 / Pub 535: limited to net profit from the business
+    # under which the plan is established, minus the deductible SE tax
+    if profile.health_insurance and profile.health_insurance.total_premiums > 0:
+        se_tax_deduction = result.schedule_se.deductible_se_tax if result.schedule_se else 0
+        max_health = max(total_business_income - se_tax_deduction, 0)
+        health_deduction = round(min(
+            profile.health_insurance.total_premiums,
+            max_health,
+        ), 2)
+        adjustments += health_deduction
+        qbi_business_adjustments += health_deduction
+        lines.append(LineItem("Schedule 1", "17",
+                              "Self-employed health insurance deduction",
+                              health_deduction,
+                              f"100% of premiums (${profile.health_insurance.total_premiums:,.2f}), "
+                              f"limited to net SE income minus deductible SE tax "
+                              f"(${max_health:,.2f})"))
+
+    result.adjustments = round(adjustments, 2)
+    lines.append(LineItem("Form 1040", "10",
+                          "Adjustments to income",
+                          result.adjustments))
+    return qbi_business_adjustments
+
+
+def _apply_other_taxes(
+    profile: TaxpayerProfile,
+    result: Form1040Result,
+    net_investment_income: float,
+    fs: FilingStatus,
+    lines: list[LineItem],
+) -> None:
+    """Schedule 2 taxes: Additional Medicare Tax, NIIT, and AMT."""
+    # Additional Medicare Tax (Form 8959)
+    # Per Form 8959: applies to combined W-2 Medicare wages + SE earnings
+    # exceeding the filing-status threshold
+    w2_medicare_wages = sum(w2.medicare_wages for w2 in profile.forms_w2)
+    se_medicare_earnings = (
+        result.schedule_se.taxable_se_earnings if result.schedule_se else 0.0
+    )
+    combined_medicare_earnings = w2_medicare_wages + se_medicare_earnings
+    if combined_medicare_earnings > 0:
+        result.additional_medicare = calculate_additional_medicare(
+            combined_medicare_earnings, fs
+        )
+        if result.additional_medicare > 0:
+            lines.append(LineItem("Schedule 2", "23",
+                                  "Additional Medicare Tax (0.9%)",
+                                  result.additional_medicare,
+                                  f"Combined Medicare earnings "
+                                  f"${combined_medicare_earnings:,.2f} "
+                                  f"exceeds {fs.value.upper()} threshold"))
+
+    # Net Investment Income Tax (Form 8960)
+    if net_investment_income > 0:
+        result.niit = calculate_niit(net_investment_income, result.agi, fs)
+        if result.niit > 0:
+            lines.append(LineItem("Schedule 2", "18",
+                                  "Net Investment Income Tax (3.8%)",
+                                  result.niit,
+                                  f"On ${net_investment_income:,.2f} net investment income"))
+
+    # AMT (Form 6251) — only relevant for itemizers with SALT
+    salt_for_amt = profile.state_local_tax_deduction if profile.uses_itemized_deductions else 0.0
+    if salt_for_amt > 0:
+        amt_result = calculate_amt(
+            result.taxable_income, result.tax, fs,
+            salt_deduction=salt_for_amt,
+        )
+        result.amt = amt_result.amt
+        result.form_6251 = amt_result
+        if result.amt > 0:
+            lines.append(LineItem("Schedule 2", "1",
+                                  "Alternative Minimum Tax",
+                                  result.amt))
+
+
+def _apply_credits(
+    profile: TaxpayerProfile,
+    result: Form1040Result,
+    wages: float,
+    total_business_income: float,
+    lines: list[LineItem],
+) -> float:
+    """Child tax credits (CTC/ODC/ACTC). Returns the refundable ACTC."""
+    # Earned income for ACTC: wages + SE income
+    earned_income_for_credits = wages + max(total_business_income, 0)
+    # Tax before credits = income tax + AMT (credits reduce this)
+    tax_before_credits = result.tax + result.amt
+    refundable_actc = 0.0
+
+    if profile.dependents:
+        credits_result = calculate_tax_credits(
+            profile, result.agi, tax_before_credits, earned_income_for_credits,
+        )
+        result.tax_credits = credits_result
+        result.nonrefundable_credits = credits_result.nonrefundable_credit
+        refundable_actc = credits_result.refundable_actc
+        if result.nonrefundable_credits > 0:
+            lines.append(LineItem("Form 1040", "19",
+                                  "Nonrefundable credits (CTC/ODC)",
+                                  result.nonrefundable_credits))
+    return refundable_actc
+
+
+def _apply_payments(
+    profile: TaxpayerProfile,
+    result: Form1040Result,
+    refundable_actc: float,
+    lines: list[LineItem],
+) -> None:
+    """Withholding, estimated payments, and refund or amount owed."""
+    # Federal income tax withheld (Line 25)
+    w2_withholding = sum(w2.federal_tax_withheld for w2 in profile.forms_w2)
+    form_1099_withholding = (
+        sum(f.federal_tax_withheld for f in profile.forms_1099_int)
+        + sum(f.federal_tax_withheld for f in profile.forms_1099_div)
+        + sum(f.federal_tax_withheld for f in profile.forms_1099_b)
+        + sum(f.federal_tax_withheld for f in profile.forms_1099_nec)
+        + sum(f.federal_tax_withheld for f in profile.forms_1099_r)
+    )
+    result.withholding = round(w2_withholding + form_1099_withholding, 2)
+    if result.withholding > 0:
+        lines.append(LineItem("Form 1040", "25a",
+                              "Federal income tax withheld",
+                              result.withholding))
+
+    result.estimated_payments = profile.total_estimated_payments
+    if result.estimated_payments > 0:
+        lines.append(LineItem("Form 1040", "26",
+                              "Estimated tax payments",
+                              result.estimated_payments))
+
+    result.total_payments = round(
+        result.withholding + result.estimated_payments + refundable_actc, 2
+    )
+    if refundable_actc > 0:
+        lines.append(LineItem("Form 1040", "28",
+                              "Additional Child Tax Credit (refundable)",
+                              refundable_actc))
+    lines.append(LineItem("Form 1040", "33", "Total payments",
+                          result.total_payments))
+
+    # Refund or amount owed
+    if result.total_payments > result.total_tax:
+        result.overpayment = round(result.total_payments - result.total_tax, 2)
+        lines.append(LineItem("Form 1040", "34", "Overpaid",
+                              result.overpayment))
+    else:
+        result.amount_owed = round(result.total_tax - result.total_payments, 2)
+        lines.append(LineItem("Form 1040", "37", "Amount you owe",
+                              result.amount_owed))
+
+
+def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
+    """Calculate the complete federal tax return.
+
+    This is the main entry point. It computes all forms and schedules
+    and produces a complete Form1040Result with every line item.
+    """
+    result = Form1040Result()
+    lines = []
+    fs = profile.filing_status
+
+    # ─── SCHEDULE C (for each business) ─────────────────────────
+    total_business_income = _apply_schedule_c(profile, result, lines)
 
     # ─── SCHEDULE E (Rental + K-1 income) ────────────────────────
     sch_e = None
@@ -1360,7 +1563,6 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
     # Lines 4a/4b: IRA distributions / pensions (1099-R)
     ira_gross = sum(f.gross_distribution for f in profile.forms_1099_r)
     ira_taxable = sum(f.taxable_amount for f in profile.forms_1099_r)
-    ira_withholding = sum(f.federal_tax_withheld for f in profile.forms_1099_r)
     result.ira_distributions = round(ira_taxable, 2)
     if ira_gross > 0:
         lines.append(LineItem("Form 1040", "4a", "IRA distributions (gross)",
@@ -1414,38 +1616,9 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                           result.total_income))
 
     # ─── ADJUSTMENTS TO INCOME (Schedule 1, Part II) ───────────
-    adjustments = 0.0
-
-    # Deductible half of SE tax
-    if result.schedule_se:
-        adj_se = result.schedule_se.deductible_se_tax
-        adjustments += adj_se
-        lines.append(LineItem("Schedule 1", "15",
-                              "Deductible part of self-employment tax",
-                              adj_se))
-
-    # Self-employed health insurance deduction
-    # Per Form 7206 / Pub 535: limited to net profit from the business
-    # under which the plan is established, minus the deductible SE tax
-    if profile.health_insurance and profile.health_insurance.total_premiums > 0:
-        se_tax_deduction = result.schedule_se.deductible_se_tax if result.schedule_se else 0
-        max_health = max(total_business_income - se_tax_deduction, 0)
-        health_deduction = round(min(
-            profile.health_insurance.total_premiums,
-            max_health,
-        ), 2)
-        adjustments += health_deduction
-        lines.append(LineItem("Schedule 1", "17",
-                              "Self-employed health insurance deduction",
-                              health_deduction,
-                              f"100% of premiums (${profile.health_insurance.total_premiums:,.2f}), "
-                              f"limited to net SE income minus deductible SE tax "
-                              f"(${max_health:,.2f})"))
-
-    result.adjustments = round(adjustments, 2)
-    lines.append(LineItem("Form 1040", "10",
-                          "Adjustments to income",
-                          result.adjustments))
+    qbi_business_adjustments = _apply_adjustments(
+        profile, result, total_business_income, lines
+    )
 
     # ─── AGI ───────────────────────────────────────────────────
     result.agi = round(result.total_income - result.adjustments, 2)
@@ -1475,6 +1648,7 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
         taxable_before_qbi, result.schedule_c_results, fs,
         k1_qbi=k1_qbi, k1_w2_wages=k1_w2_wages, k1_ubia=k1_ubia,
         net_capital_gain=qbi_net_cap_gain,
+        business_adjustments=qbi_business_adjustments,
     )
     result.qbi = qbi_result
     result.qbi_deduction = qbi_result.qbi_deduction
@@ -1510,67 +1684,13 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                           result.tax,
                           f"From {tax_method}"))
 
-    # Additional Medicare Tax (Form 8959)
-    # Per Form 8959: applies to combined W-2 Medicare wages + SE earnings
-    # exceeding the filing-status threshold
-    w2_medicare_wages = sum(w2.medicare_wages for w2 in profile.forms_w2)
-    se_medicare_earnings = (
-        result.schedule_se.taxable_se_earnings if result.schedule_se else 0.0
-    )
-    combined_medicare_earnings = w2_medicare_wages + se_medicare_earnings
-    if combined_medicare_earnings > 0:
-        result.additional_medicare = calculate_additional_medicare(
-            combined_medicare_earnings, fs
-        )
-        if result.additional_medicare > 0:
-            lines.append(LineItem("Schedule 2", "23",
-                                  "Additional Medicare Tax (0.9%)",
-                                  result.additional_medicare,
-                                  f"Combined Medicare earnings "
-                                  f"${combined_medicare_earnings:,.2f} "
-                                  f"exceeds {fs.value.upper()} threshold"))
-
-    # Net Investment Income Tax (Form 8960)
-    if net_investment_income > 0:
-        result.niit = calculate_niit(net_investment_income, result.agi, fs)
-        if result.niit > 0:
-            lines.append(LineItem("Schedule 2", "18",
-                                  "Net Investment Income Tax (3.8%)",
-                                  result.niit,
-                                  f"On ${net_investment_income:,.2f} net investment income"))
-
-    # AMT (Form 6251) — only relevant for itemizers with SALT
-    salt_for_amt = profile.state_local_tax_deduction if profile.uses_itemized_deductions else 0.0
-    if salt_for_amt > 0:
-        amt_result = calculate_amt(
-            result.taxable_income, result.tax, fs,
-            salt_deduction=salt_for_amt,
-        )
-        result.amt = amt_result.amt
-        result.form_6251 = amt_result
-        if result.amt > 0:
-            lines.append(LineItem("Schedule 2", "1",
-                                  "Alternative Minimum Tax",
-                                  result.amt))
+    # ─── OTHER TAXES (Schedule 2) ──────────────────────────────
+    _apply_other_taxes(profile, result, net_investment_income, fs, lines)
 
     # ─── TAX CREDITS ─────────────────────────────────────────
-    # Earned income for ACTC: wages + SE income
-    earned_income_for_credits = wages + max(total_business_income, 0)
-    # Tax before credits = income tax + AMT (credits reduce this)
-    tax_before_credits = result.tax + result.amt
-    refundable_actc = 0.0
-
-    if profile.dependents:
-        credits_result = calculate_tax_credits(
-            profile, result.agi, tax_before_credits, earned_income_for_credits,
-        )
-        result.tax_credits = credits_result
-        result.nonrefundable_credits = credits_result.nonrefundable_credit
-        refundable_actc = credits_result.refundable_actc
-        if result.nonrefundable_credits > 0:
-            lines.append(LineItem("Form 1040", "19",
-                                  "Nonrefundable credits (CTC/ODC)",
-                                  result.nonrefundable_credits))
+    refundable_actc = _apply_credits(
+        profile, result, wages, total_business_income, lines
+    )
 
     # ─── EARLY WITHDRAWAL PENALTY (Schedule 2, Line 8) ────────
     early_penalty = round(sum(
@@ -1603,47 +1723,8 @@ def calculate_return(profile: TaxpayerProfile) -> Form1040Result:
                           + (f" - credits ${result.nonrefundable_credits:,.2f}"
                              if result.nonrefundable_credits else "")))
 
-    # ─── PAYMENTS ──────────────────────────────────────────────
-    # Federal income tax withheld (Line 25)
-    w2_withholding = sum(w2.federal_tax_withheld for w2 in profile.forms_w2)
-    form_1099_withholding = (
-        sum(f.federal_tax_withheld for f in profile.forms_1099_int)
-        + sum(f.federal_tax_withheld for f in profile.forms_1099_div)
-        + sum(f.federal_tax_withheld for f in profile.forms_1099_b)
-        + sum(f.federal_tax_withheld for f in profile.forms_1099_nec)
-        + ira_withholding
-    )
-    result.withholding = round(w2_withholding + form_1099_withholding, 2)
-    if result.withholding > 0:
-        lines.append(LineItem("Form 1040", "25a",
-                              "Federal income tax withheld",
-                              result.withholding))
-
-    result.estimated_payments = profile.total_estimated_payments
-    if result.estimated_payments > 0:
-        lines.append(LineItem("Form 1040", "26",
-                              "Estimated tax payments",
-                              result.estimated_payments))
-
-    result.total_payments = round(
-        result.withholding + result.estimated_payments + refundable_actc, 2
-    )
-    if refundable_actc > 0:
-        lines.append(LineItem("Form 1040", "28",
-                              "Additional Child Tax Credit (refundable)",
-                              refundable_actc))
-    lines.append(LineItem("Form 1040", "33", "Total payments",
-                          result.total_payments))
-
-    # ─── REFUND OR AMOUNT OWED ─────────────────────────────────
-    if result.total_payments > result.total_tax:
-        result.overpayment = round(result.total_payments - result.total_tax, 2)
-        lines.append(LineItem("Form 1040", "34", "Overpaid",
-                              result.overpayment))
-    else:
-        result.amount_owed = round(result.total_tax - result.total_payments, 2)
-        lines.append(LineItem("Form 1040", "37", "Amount you owe",
-                              result.amount_owed))
+    # ─── PAYMENTS, REFUND OR AMOUNT OWED ───────────────────────
+    _apply_payments(profile, result, refundable_actc, lines)
 
     result.lines = lines
     return result
@@ -1695,6 +1776,39 @@ def compare_feie_scenarios(profile: TaxpayerProfile) -> dict:
             else "Skip the FEIE — not beneficial for your situation"
         ),
     }
+
+
+def apply_feie_to_result(result: Form1040Result, feie: Form2555Result) -> None:
+    """Fold a beneficial FEIE evaluation into a completed return.
+
+    FEIE is evaluated separately from calculate_return() via
+    compare_feie_scenarios(). When the exclusion is beneficial, this
+    attaches the Form 2555 result and updates the return totals so the
+    generated Form 1040 stays consistent with the attached Form 2555.
+    SE tax is unchanged by FEIE.
+
+    Note: result.lines retains the pre-FEIE line-item breakdown; only
+    the numeric totals (tax, total_tax, overpayment/amount_owed) are
+    updated.
+    """
+    result.feie = feie
+    if not feie.is_beneficial:
+        return
+
+    result.tax = feie.tax_with_feie
+    result.total_tax = round(
+        result.tax + result.se_tax + result.additional_medicare
+        + result.niit + result.amt + result.early_withdrawal_penalty
+        - result.nonrefundable_credits, 2
+    )
+    result.total_tax = max(result.total_tax, 0)
+
+    if result.total_payments > result.total_tax:
+        result.overpayment = round(result.total_payments - result.total_tax, 2)
+        result.amount_owed = 0.0
+    else:
+        result.amount_owed = round(result.total_tax - result.total_payments, 2)
+        result.overpayment = 0.0
 
 
 def estimate_quarterly_payments(

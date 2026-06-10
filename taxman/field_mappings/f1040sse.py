@@ -7,6 +7,7 @@ Page 1: f1_1..f1_22, c1_1
 Page 2: f2_1..f2_4
 """
 
+from taxman.constants import SS_WAGE_BASE
 from taxman.field_mappings.common import format_currency_for_pdf, format_ssn
 
 
@@ -47,7 +48,7 @@ def build_schedule_se_data(se_result, profile=None) -> dict:
     # Line 7 ($176,100) is pre-printed
 
     # f1_14: Line 8a — W-2 social security wages
-    w2_ss = getattr(se_result, 'w2_ss_wages', 0) or 0
+    w2_ss = se_result.w2_ss_wages or 0
     if w2_ss > 0:
         data["f1_14[0]"] = format_currency_for_pdf(w2_ss)
     # f1_15: Line 8b — Unreported tips (skip)
@@ -57,8 +58,7 @@ def build_schedule_se_data(se_result, profile=None) -> dict:
         data["f1_17[0]"] = format_currency_for_pdf(w2_ss)
 
     # f1_18: Line 9 — Subtract line 8d from line 7
-    ss_wage_base = 176100
-    remaining_base = max(ss_wage_base - w2_ss, 0)
+    remaining_base = max(SS_WAGE_BASE - w2_ss, 0)
     data["f1_18[0]"] = format_currency_for_pdf(remaining_base)
 
     # f1_19: Line 10 — Multiply smaller of line 6 or line 9 by 12.4%

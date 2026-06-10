@@ -119,7 +119,17 @@ def download_irs_form(form_key: str, force: bool = False) -> Path:
         raise ValueError(f"Unknown form: {form_key}. Available: {list(IRS_FORM_URLS.keys())}")
 
     print(f"Downloading {form_key} from {url}...")
-    urllib.request.urlretrieve(url, output_path)
+    # Download to a temp path so a failed transfer never leaves a
+    # partial file that later runs would treat as a valid cached PDF
+    tmp_path = output_path.with_suffix(".pdf.download")
+    try:
+        urllib.request.urlretrieve(url, tmp_path)
+    except OSError as e:
+        tmp_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Failed to download {form_key} from {url}: {e}"
+        ) from e
+    os.replace(tmp_path, output_path)
     _patch_checkbox_appearances(output_path)
     patch_marker.touch()
     print(f"Saved to {output_path}")
@@ -220,13 +230,17 @@ def fill_and_flatten(form_key: str, data: dict, output_path: str) -> str:
 # Form Generation Pipeline (Phase 6)
 # =============================================================================
 
-def generate_all_forms(result, profile, output_dir: str) -> list[str]:
+def generate_all_forms(
+    result, profile, output_dir: str, filename_suffix: str = "filled"
+) -> list[str]:
     """Orchestrate generation of all required tax forms.
 
     Args:
         result: Form1040Result from calculator
         profile: TaxpayerProfile
         output_dir: Directory to save generated PDFs
+        filename_suffix: Appended to each filename (e.g. a date stamp);
+            defaults to "filled" → f1040_filled.pdf
 
     Returns:
         List of paths to generated PDFs
@@ -249,62 +263,46 @@ def generate_all_forms(result, profile, output_dir: str) -> list[str]:
         print("Field mappings not yet configured — skipping form generation.")
         return generated
 
-    # Form 1040
-    try:
-        data_1040 = build_1040_data(result, profile)
-        path = fill_form("f1040", data_1040, str(output / "f1040_filled.pdf"))
-        generated.append(path)
-    except Exception as e:
-        print(f"Error generating 1040: {e}")
+    # (description, form_key, output basename, data builder)
+    specs = [
+        ("Form 1040", "f1040", "f1040",
+         lambda: build_1040_data(result, profile)),
+    ]
 
-    # Schedule C (one per business)
     for i, sc_result in enumerate(result.schedule_c_results):
-        try:
-            biz = profile.businesses[i] if i < len(profile.businesses) else None
-            data_sc = build_schedule_c_data(sc_result, biz, profile)
-            path = fill_form(
-                "f1040sc", data_sc,
-                str(output / f"schedule_c_{i+1}_filled.pdf")
-            )
-            generated.append(path)
-        except Exception as e:
-            print(f"Error generating Schedule C #{i+1}: {e}")
+        biz = profile.businesses[i] if i < len(profile.businesses) else None
+        specs.append((
+            f"Schedule C #{i+1}", "f1040sc", f"schedule_c_{i+1}",
+            lambda sc=sc_result, b=biz: build_schedule_c_data(sc, b, profile),
+        ))
 
-    # Schedule SE
     if result.schedule_se and result.schedule_se.se_tax > 0:
-        try:
-            data_se = build_schedule_se_data(result.schedule_se, profile)
-            path = fill_form("f1040sse", data_se, str(output / "schedule_se_filled.pdf"))
-            generated.append(path)
-        except Exception as e:
-            print(f"Error generating Schedule SE: {e}")
+        specs.append(("Schedule SE", "f1040sse", "schedule_se",
+                      lambda: build_schedule_se_data(result.schedule_se, profile)))
 
-    # Schedule E
     if result.schedule_e:
-        try:
-            data_e = build_schedule_e_data(result.schedule_e, profile)
-            path = fill_form("f1040se", data_e, str(output / "schedule_e_filled.pdf"))
-            generated.append(path)
-        except Exception as e:
-            print(f"Error generating Schedule E: {e}")
+        specs.append(("Schedule E", "f1040se", "schedule_e",
+                      lambda: build_schedule_e_data(result.schedule_e, profile)))
 
-    # Form 8995 (QBI)
     if result.qbi and result.qbi.qbi_deduction > 0:
-        try:
-            data_qbi = build_8995_data(result.qbi, result, profile)
-            form_key = "f8995a" if result.qbi.is_limited else "f8995"
-            path = fill_form(form_key, data_qbi, str(output / "f8995_filled.pdf"))
-            generated.append(path)
-        except Exception as e:
-            print(f"Error generating Form 8995: {e}")
+        qbi_key = "f8995a" if result.qbi.is_limited else "f8995"
+        specs.append(("Form 8995", qbi_key, "f8995",
+                      lambda: build_8995_data(result.qbi, result, profile)))
 
     # Form 2555 (FEIE) — only if beneficial
     if result.feie and result.feie.is_beneficial:
+        specs.append(("Form 2555", "f2555", "f2555",
+                      lambda: build_2555_data(result.feie, profile)))
+
+    for description, form_key, basename, build_data in specs:
         try:
-            data_2555 = build_2555_data(result.feie, profile)
-            path = fill_form("f2555", data_2555, str(output / "f2555_filled.pdf"))
+            data = build_data()
+            path = fill_form(
+                form_key, data,
+                str(output / f"{basename}_{filename_suffix}.pdf"),
+            )
             generated.append(path)
         except Exception as e:
-            print(f"Error generating Form 2555: {e}")
+            print(f"Error generating {description}: {e}")
 
     return generated

@@ -224,7 +224,7 @@ def build_schedule_e_data(se_result, profile=None) -> dict:
             # Ordinary business income (Box 1) + guaranteed payments (Box 4) = nonpassive
             nonpassive = (k1.ordinary_business_income + k1.guaranteed_payments
                           + k1.interest_income + k1.royalties
-                          + k1.net_st_capital_gain + k1.capital_gains
+                          + k1.net_short_term_capital_gain + k1.net_long_term_capital_gain
                           + k1.net_section_1231_gain + k1.other_income)
             if nonpassive > 0:
                 data[k1_nonpassive_inc[i]] = format_currency_for_pdf(nonpassive)

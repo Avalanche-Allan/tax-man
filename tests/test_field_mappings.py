@@ -34,6 +34,7 @@ from taxman.models import (
     BusinessExpenses,
     BusinessType,
     FilingStatus,
+    FormW2,
     HomeOffice,
     ScheduleCData,
     ScheduleK1,
@@ -331,6 +332,31 @@ class TestScheduleSELineMath:
                 f"Deductible ({deductible}) should be ~50% of SE tax ({se_tax})"
             )
 
+    def test_w2_ss_wages_reduce_wage_base(self):
+        """Line 8a shows W-2 SS wages and Line 9 shows the reduced base."""
+        from taxman.constants import SS_WAGE_BASE
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.SINGLE,
+            forms_w2=[FormW2(
+                employer_name="Acme",
+                wages=60_000,
+                ss_wages=60_000,
+                medicare_wages=60_000,
+            )],
+            businesses=[ScheduleCData(
+                business_name="Side Biz",
+                gross_receipts=50_000,
+            )],
+        )
+        result = calculate_return(profile)
+        data = build_schedule_se_data(result.schedule_se, profile)
+
+        line_8a = _parse_currency(data.get("f1_14[0]", "0"))  # W-2 SS wages
+        line_9 = _parse_currency(data.get("f1_18[0]", "0"))   # Remaining base
+
+        assert line_8a == 60_000
+        assert line_9 == SS_WAGE_BASE - 60_000
+
 
 class TestForm1040LineMath:
     """Form 1040: income lines and tax consistency."""
@@ -521,6 +547,40 @@ class TestGoldenFileSnapshots:
         # so we just verify the PDF was created successfully
         assert Path(output_path).exists()
         assert Path(output_path).stat().st_size > 10_000
+
+
+# =============================================================================
+# generate_all_forms orchestration
+# =============================================================================
+
+class TestGenerateAllForms:
+    """generate_all_forms produces the expected set of filled PDFs."""
+
+    @_skip_no_forms
+    def test_default_suffix_filenames(self, tmp_path):
+        from taxman.fill_forms import generate_all_forms
+        profile = _build_test_profile()
+        result = _build_test_result(profile)
+        paths = generate_all_forms(result, profile, str(tmp_path))
+
+        names = {Path(p).name for p in paths}
+        assert "f1040_filled.pdf" in names
+        assert "schedule_c_1_filled.pdf" in names
+        if result.schedule_se and result.schedule_se.se_tax > 0:
+            assert "schedule_se_filled.pdf" in names
+        for p in paths:
+            assert Path(p).stat().st_size > 10_000
+
+    @_skip_no_forms
+    def test_custom_suffix_filenames(self, tmp_path):
+        from taxman.fill_forms import generate_all_forms
+        profile = _build_test_profile()
+        result = _build_test_result(profile)
+        paths = generate_all_forms(
+            result, profile, str(tmp_path), filename_suffix="2026-06-09"
+        )
+        assert all("2026-06-09.pdf" in Path(p).name for p in paths)
+        assert any(Path(p).name == "f1040_2026-06-09.pdf" for p in paths)
 
 
 # =============================================================================

@@ -40,6 +40,7 @@ from taxman.models import (
     BusinessExpenses,
     Dependent,
     FilingStatus,
+    HealthInsurance,
     Form1099B,
     Form1099DIV,
     Form1099INT,
@@ -511,6 +512,42 @@ class TestCalculateQBI:
         assert result.qbi is not None
         assert result.qbi.qbi_deduction >= 0
 
+    def test_adjustments_reduce_qbi(self):
+        """Deductible SE tax and similar business adjustments reduce QBI."""
+        from taxman.calculator import ScheduleCResult
+        sc = ScheduleCResult(business_name="Adjusted Biz", net_profit_loss=80_000)
+        result = calculate_qbi_deduction(
+            80_000, [sc], FilingStatus.MFS, business_adjustments=5_000,
+        )
+        assert result.total_qbi == 75_000
+        assert result.qbi_deduction == 15_000
+
+    def test_adjustments_eliminate_qbi(self):
+        """Adjustments exceeding QBI yield zero deduction, not negative."""
+        from taxman.calculator import ScheduleCResult
+        sc = ScheduleCResult(business_name="Small Biz", net_profit_loss=10_000)
+        result = calculate_qbi_deduction(
+            10_000, [sc], FilingStatus.MFS, business_adjustments=15_000,
+        )
+        assert result.qbi_deduction == 0
+
+    def test_return_qbi_reduced_by_se_tax_and_health_insurance(self):
+        """Integration check for allocable Schedule C adjustments."""
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            businesses=[
+                ScheduleCData(
+                    business_name="Consulting",
+                    gross_receipts=100_000,
+                ),
+            ],
+            health_insurance=HealthInsurance(total_premiums=5_000),
+        )
+        result = calculate_return(profile)
+        assert result.qbi is not None
+        assert result.qbi.total_qbi == 87_935.23
+        assert result.qbi.qbi_deduction == 14_437.05
+
 
 # =============================================================================
 # TestCalculateIncomeTax
@@ -930,8 +967,10 @@ class TestK1QBI:
             ],
         )
         result = calculate_return(profile)
-        # SSTB K-1 QBI should be excluded
-        assert result.qbi.total_qbi == 50_000  # Only Schedule C
+        # SSTB K-1 QBI should be excluded; Schedule C QBI is reduced
+        # by the deductible half of SE tax
+        expected = 50_000 - result.schedule_se.deductible_se_tax
+        assert result.qbi.total_qbi == pytest.approx(expected)
 
     def test_k1_qbi_in_full_return(self):
         """K-1 QBI flows through calculate_return correctly."""
@@ -953,8 +992,10 @@ class TestK1QBI:
             ],
         )
         result = calculate_return(profile)
-        # Total QBI should include both Schedule C and K-1
-        assert result.qbi.total_qbi == 80_000  # 50K + 30K
+        # Total QBI includes both Schedule C and K-1, with Schedule C
+        # QBI reduced by the deductible half of SE tax
+        expected = 80_000 - result.schedule_se.deductible_se_tax
+        assert result.qbi.total_qbi == pytest.approx(expected)
 
 
 # =============================================================================
@@ -1495,7 +1536,13 @@ class TestCalculateReturn:
         total_biz = sum(sc.net_profit_loss for sc in result.schedule_c_results)
         se_ded = result.schedule_se.deductible_se_tax if result.schedule_se else 0
         max_health = max(total_biz - se_ded, 0)
-        # Actual deduction can't exceed premiums or max_health
+        health_line = next(
+            (l for l in result.lines
+             if l.form == "Schedule 1" and l.line == "17"),
+            None,
+        )
+        assert health_line is not None
+        assert health_line.amount <= max_health
         assert result.adjustments <= total_biz  # rough upper bound
 
     def test_mfs_rental_loss_suspended(self, mfs_expat):
@@ -1737,6 +1784,55 @@ class TestFEIEIntegration:
         )
         scenarios = compare_feie_scenarios(profile)
         assert isinstance(scenarios["feie_result"], Form2555Result)
+
+    def test_apply_feie_updates_totals(self):
+        """apply_feie_to_result folds reduced tax into return totals."""
+        from taxman.calculator import apply_feie_to_result
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            days_in_foreign_country_2025=340,
+            businesses=[ScheduleCData(
+                business_name="Remote Consulting",
+                gross_receipts=120_000,
+            )],
+        )
+        result = calculate_return(profile)
+        feie = compare_feie_scenarios(profile)["feie_result"]
+        assert feie.is_beneficial
+
+        apply_feie_to_result(result, feie)
+
+        assert result.feie is feie
+        assert result.tax == feie.tax_with_feie
+        # Total tax recomputed from the FEIE income tax; SE tax unchanged
+        expected_total = max(round(
+            feie.tax_with_feie + result.se_tax + result.additional_medicare
+            + result.niit + result.amt + result.early_withdrawal_penalty
+            - result.nonrefundable_credits, 2), 0)
+        assert result.total_tax == expected_total
+        assert result.amount_owed == round(
+            result.total_tax - result.total_payments, 2)
+
+    def test_apply_feie_not_beneficial_keeps_totals(self):
+        """A non-beneficial FEIE attaches the form but leaves totals alone."""
+        from taxman.calculator import apply_feie_to_result
+        profile = TaxpayerProfile(
+            filing_status=FilingStatus.MFS,
+            businesses=[ScheduleCData(
+                business_name="Consulting",
+                gross_receipts=80_000,
+            )],
+        )
+        result = calculate_return(profile)
+        original_tax = result.tax
+        original_total = result.total_tax
+
+        feie = Form2555Result(is_beneficial=False, tax_with_feie=0.0)
+        apply_feie_to_result(result, feie)
+
+        assert result.feie is feie
+        assert result.tax == original_tax
+        assert result.total_tax == original_total
 
 
 # =============================================================================
