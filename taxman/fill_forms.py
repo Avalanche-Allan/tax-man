@@ -5,6 +5,7 @@ Uses PyPDFForm for pure-Python PDF manipulation (no pdftk needed).
 """
 
 import os
+import re
 import shutil
 import urllib.request
 from pathlib import Path
@@ -310,11 +311,138 @@ def fill_and_flatten(form_key: str, data: dict, output_path: str) -> str:
 
 
 # =============================================================================
+# Filing Packet Assembly
+# =============================================================================
+
+# IRS attachment sequence numbers (printed top-right on each schedule).
+# The 1040 itself goes first; schedules follow in sequence order.
+_FEDERAL_SEQUENCE = {
+    "f1040": -1,
+    "schedule_1": 1,
+    "schedule_2": 2,
+    "schedule_3": 3,
+    "schedule_c": 9,
+    "schedule_d": 12,
+    "schedule_e": 13,
+    "schedule_se": 17,
+    "f2555": 34,
+    "f8995": 55,
+}
+_COLORADO_SEQUENCE = {
+    "co_dr0104pn": 1,
+    "co_dr0104": 0,
+}
+
+
+def _packet_sort_key(path: str, sequence: dict) -> tuple:
+    """Sort key: (attachment sequence, filename) — filename breaks ties
+    between multiple copies of the same schedule (schedule_c_1, _2...)."""
+    name = Path(path).name
+    # Longest matching basename prefix wins (schedule_c_1 → schedule_c)
+    seq = 999
+    best_len = 0
+    for prefix, s in sequence.items():
+        if name.startswith(prefix) and len(prefix) > best_len:
+            seq = s
+            best_len = len(prefix)
+    return (seq, name)
+
+
+_NUMERIC_VALUE = re.compile(r"-?[\d,]+(\.\d+)?")
+
+
+def _flatten_filled_pdf(path: str):
+    """Open a filled PDF and burn its field values into page content.
+
+    pymupdf's bake() correctly bakes checkbox appearances but drops
+    PyPDFForm-written text values (their appearance streams confuse
+    MuPDF — "not a dict" errors). So text values are drawn onto the
+    page explicitly first, then bake() removes the widgets and bakes
+    the checkbox glyphs. Numeric values are right-aligned like the
+    original form fields.
+    """
+    import fitz
+
+    doc = fitz.open(path)
+    for page in doc:
+        for widget in page.widgets():
+            if widget.field_type != fitz.PDF_WIDGET_TYPE_TEXT:
+                continue
+            value = str(widget.field_value or "")
+            if not value:
+                continue
+            rect = widget.rect
+            fontsize = min(10, rect.height - 2)
+            if _NUMERIC_VALUE.fullmatch(value):
+                width = fitz.get_text_length(
+                    value, fontname="helv", fontsize=fontsize
+                )
+                x = rect.x1 - width - 2
+            else:
+                x = rect.x0 + 1
+            page.insert_text(
+                (x, rect.y1 - rect.height * 0.25),
+                value, fontsize=fontsize, fontname="helv",
+            )
+    doc.bake()
+    return doc
+
+
+def assemble_filing_packets(
+    pdf_paths: list, output_dir: str, filename_suffix: str = "filled"
+) -> list:
+    """Merge generated form PDFs into print-ready filing packets.
+
+    Produces a federal packet (1040 + schedules in IRS attachment-
+    sequence order) and, when Colorado forms are present, a Colorado
+    packet (DR 0104 + DR 0104PN). Form fields are flattened into the
+    page content before merging — several forms reuse the same internal
+    field names (e.g. two Schedule C copies), which would otherwise
+    clobber each other in the combined document.
+
+    Returns:
+        List of packet paths created.
+    """
+    import fitz
+
+    federal = [p for p in pdf_paths if not Path(p).name.startswith("co_")]
+    colorado = [p for p in pdf_paths if Path(p).name.startswith("co_")]
+
+    # bake() complains (harmlessly) about PyPDFForm appearance streams
+    fitz.TOOLS.mupdf_display_errors(False)
+    packets = []
+    try:
+        for paths, sequence, basename in (
+            (federal, _FEDERAL_SEQUENCE, "federal_return"),
+            (colorado, _COLORADO_SEQUENCE, "colorado_return"),
+        ):
+            if not paths:
+                continue
+            merged = fitz.open()
+            for path in sorted(
+                paths, key=lambda p: _packet_sort_key(p, sequence)
+            ):
+                src = _flatten_filled_pdf(path)
+                merged.insert_pdf(src)
+                src.close()
+            out = Path(output_dir) / f"{basename}_{filename_suffix}.pdf"
+            merged.save(str(out))
+            merged.close()
+            print(f"Assembled {basename} packet → {out}")
+            packets.append(str(out))
+    finally:
+        fitz.TOOLS.mupdf_display_errors(True)
+
+    return packets
+
+
+# =============================================================================
 # Form Generation Pipeline (Phase 6)
 # =============================================================================
 
 def generate_all_forms(
-    result, profile, output_dir: str, filename_suffix: str = "filled"
+    result, profile, output_dir: str, filename_suffix: str = "filled",
+    assemble_packets: bool = True,
 ) -> list[str]:
     """Orchestrate generation of all required tax forms.
 
@@ -324,9 +452,11 @@ def generate_all_forms(
         output_dir: Directory to save generated PDFs
         filename_suffix: Appended to each filename (e.g. a date stamp);
             defaults to "filled" → f1040_filled.pdf
+        assemble_packets: Also merge the individual forms into
+            print-ready federal/Colorado packets in attachment order
 
     Returns:
-        List of paths to generated PDFs
+        List of paths to generated PDFs (packets last)
     """
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -423,5 +553,13 @@ def generate_all_forms(
             generated.append(path)
         except Exception as e:
             print(f"Error generating {description}: {e}")
+
+    if assemble_packets and generated:
+        try:
+            generated.extend(
+                assemble_filing_packets(generated, str(output), filename_suffix)
+            )
+        except Exception as e:
+            print(f"Error assembling filing packets: {e}")
 
     return generated

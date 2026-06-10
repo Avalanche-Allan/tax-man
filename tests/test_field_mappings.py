@@ -935,6 +935,73 @@ class TestGenerateAllForms:
         assert any(Path(p).name == "f1040_2026-06-09.pdf" for p in paths)
 
 
+class TestFilingPacketAssembly:
+    """Federal/Colorado packets merge in attachment-sequence order."""
+
+    @_skip_no_forms
+    def test_federal_packet_order_and_flattening(self, tmp_path):
+        import fitz
+        from taxman.fill_forms import generate_all_forms
+        profile = _build_test_profile()
+        result = _build_test_result(profile)
+        paths = generate_all_forms(result, profile, str(tmp_path))
+
+        packets = [p for p in paths if "federal_return" in Path(p).name]
+        assert len(packets) == 1
+        individual = [
+            p for p in paths
+            if "return_" not in Path(p).name
+        ]
+        expected_pages = 0
+        for p in individual:
+            with fitz.open(p) as doc:
+                expected_pages += doc.page_count
+
+        doc = fitz.open(packets[0])
+        assert doc.page_count == expected_pages
+        # 1040 first, fields flattened (no live widgets remain) with
+        # text values burned into the page content
+        page1_text = doc[0].get_text()
+        assert "U.S. Individual Income Tax Return" in page1_text
+        assert "User" in page1_text  # taxpayer name survives flattening
+        assert f"{round(result.total_income):,}" in page1_text
+        assert sum(1 for page in doc for _ in page.widgets()) == 0
+        # Attachment-sequence order: Sch 1 → Sch C → Sch SE
+        texts = [doc[i].get_text() for i in range(doc.page_count)]
+        idx_s1 = next(i for i, t in enumerate(texts)
+                      if "Additional Income and Adjustments" in t)
+        idx_sc = next(i for i, t in enumerate(texts)
+                      if "Profit or Loss From Business" in t)
+        idx_sse = next(i for i, t in enumerate(texts)
+                       if "Self-Employment Tax" in t)
+        assert idx_s1 < idx_sc < idx_sse
+        doc.close()
+
+    @_skip_no_forms
+    def test_colorado_packet(self, tmp_path):
+        import fitz
+        from taxman.fill_forms import generate_all_forms
+        from taxman.models import ScheduleEProperty
+        profile = _build_test_profile()
+        profile.has_colorado_filing_obligation = True
+        profile.schedule_e_properties = [ScheduleEProperty(
+            property_address="100 Test St, Denver, CO 80202",
+            gross_rents=20_000,
+            mortgage_interest=5_000,
+        )]
+        result = _build_test_result(profile)
+        paths = generate_all_forms(result, profile, str(tmp_path))
+
+        co_packets = [p for p in paths if "colorado_return" in Path(p).name]
+        assert len(co_packets) == 1
+        doc = fitz.open(co_packets[0])
+        # DR 0104 (8 pages) followed by DR 0104PN (8 pages)
+        assert doc.page_count == 16
+        assert "Colorado Individual Income Tax Return" in doc[0].get_text()
+        assert "Part-Year Resident/Nonresident" in doc[8].get_text()
+        doc.close()
+
+
 # =============================================================================
 # Fix 5: No Guessed Field Mappings
 # =============================================================================
